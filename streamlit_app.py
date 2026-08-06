@@ -3,7 +3,7 @@ import hashlib
 import hmac
 import secrets
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import pandas as pd
@@ -117,7 +117,7 @@ def refresh_access_token(client_id: str, client_secret: str) -> None:
     )
 
 
-def api_get(path: str, params: dict, client_id: str, client_secret: str) -> dict:
+def api_get(path: str, params, client_id: str, client_secret: str) -> dict:
     tokens = st.session_state.bling_tokens
     if time.time() >= tokens.get("expires_at", 0):
         refresh_access_token(client_id, client_secret)
@@ -147,12 +147,19 @@ def api_get(path: str, params: dict, client_id: str, client_secret: str) -> dict
     return response.json()
 
 
-def fetch_all(path: str, client_id: str, client_secret: str) -> list[dict]:
+def fetch_all(
+    path: str,
+    client_id: str,
+    client_secret: str,
+    extra_params: dict | None = None,
+) -> list[dict]:
     records: list[dict] = []
     for page in range(1, 501):
+        params = {"pagina": page, "limite": 100}
+        params.update(extra_params or {})
         payload = api_get(
             path,
-            {"pagina": page, "limite": 100},
+            params,
             client_id,
             client_secret,
         )
@@ -165,6 +172,107 @@ def fetch_all(path: str, client_id: str, client_secret: str) -> list[dict]:
         if len(batch) < 100:
             break
     return records
+
+
+def chunks(values: list, size: int):
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def fetch_stock_balances(
+    product_ids: list[int], client_id: str, client_secret: str
+) -> list[dict]:
+    """The Bling endpoint requires product IDs and is not paginated."""
+    balances: list[dict] = []
+    for group in chunks(product_ids, 100):
+        params = [("idsProdutos[]", product_id) for product_id in group]
+        payload = api_get("estoques/saldos", params, client_id, client_secret)
+        data = payload.get("data", [])
+        balances.extend(data if isinstance(data, list) else [data])
+    return balances
+
+
+def fetch_product_categories(
+    products: list[dict], client_id: str, client_secret: str
+) -> dict[int, str]:
+    categories = fetch_all("categorias/produtos", client_id, client_secret)
+    category_names = {
+        int(item["id"]): str(item.get("descricao") or "Sem categoria")
+        for item in categories
+        if item.get("id") is not None
+    }
+    product_categories: dict[int, str] = {}
+    progress = st.progress(0, text="Carregando categorias dos produtos...")
+    total = max(len(products), 1)
+    for index, product in enumerate(products, start=1):
+        product_id = int(product.get("id", 0) or 0)
+        detail = api_get(
+            f"produtos/{product_id}", {}, client_id, client_secret
+        ).get("data", {})
+        category_id = nested_value(detail, "categoria.id")
+        product_categories[product_id] = category_names.get(
+            int(category_id) if category_id is not None else 0,
+            "Sem categoria",
+        )
+        progress.progress(index / total, text="Carregando categorias dos produtos...")
+    progress.empty()
+    return product_categories
+
+
+def fetch_sales_consumption(
+    start_date: date,
+    end_date: date,
+    client_id: str,
+    client_secret: str,
+) -> tuple[dict[int, float], int, list[str]]:
+    orders = fetch_all(
+        "pedidos/vendas",
+        client_id,
+        client_secret,
+        {"dataInicial": start_date.isoformat(), "dataFinal": end_date.isoformat()},
+    )
+    warnings: list[str] = []
+    situation_names: dict[int, str] = {}
+    for situation_id in {
+        nested_value(order, "situacao.id") for order in orders
+    } - {None}:
+        try:
+            data = api_get(
+                f"situacoes/{int(situation_id)}", {}, client_id, client_secret
+            ).get("data", {})
+            situation_names[int(situation_id)] = str(data.get("nome") or "")
+        except requests.RequestException:
+            situation_names[int(situation_id)] = ""
+
+    valid_orders = []
+    for order in orders:
+        situation_id = nested_value(order, "situacao.id")
+        situation_name = situation_names.get(int(situation_id or 0), "").lower()
+        if "cancel" not in situation_name:
+            valid_orders.append(order)
+
+    consumption: dict[int, float] = {}
+    progress = st.progress(0, text="Calculando consumo pelos pedidos de venda...")
+    total = max(len(valid_orders), 1)
+    for index, order in enumerate(valid_orders, start=1):
+        detail = api_get(
+            f"pedidos/vendas/{int(order['id'])}", {}, client_id, client_secret
+        ).get("data", {})
+        for item in detail.get("itens", []):
+            product_id = nested_value(item, "produto.id")
+            if product_id is not None:
+                product_id = int(product_id)
+                consumption[product_id] = consumption.get(product_id, 0.0) + number(
+                    item.get("quantidade")
+                )
+        progress.progress(index / total, text="Calculando consumo pelos pedidos de venda...")
+    progress.empty()
+    if orders and not any(situation_names.values()):
+        warnings.append(
+            "Não foi possível identificar os nomes das situações; os pedidos "
+            "cancelados podem estar incluídos no consumo."
+        )
+    return consumption, len(valid_orders), warnings
 
 
 def nested_value(item: dict, *paths, default=None):
@@ -213,7 +321,13 @@ def stock_index(balances: list[dict]) -> dict[int, dict]:
     return result
 
 
-def normalize_inventory(products: list[dict], balances: list[dict]) -> pd.DataFrame:
+def normalize_inventory(
+    products: list[dict],
+    balances: list[dict],
+    product_categories: dict[int, str],
+    consumption: dict[int, float],
+    analysis_days: int,
+) -> pd.DataFrame:
     stocks = stock_index(balances)
     rows = []
     for product in products:
@@ -247,21 +361,15 @@ def normalize_inventory(products: list[dict], balances: list[dict]) -> pd.DataFr
                 "ID": product_id,
                 "Código": str(product.get("codigo") or "").strip(),
                 "Produto": str(product.get("nome") or "Sem nome").strip(),
-                "Categoria": str(
-                    nested_value(
-                        product,
-                        "categoria.descricao",
-                        "categoria.nome",
-                        "categoria.id",
-                        default="Sem categoria",
-                    )
-                ),
+                "Categoria": product_categories.get(product_id, "Sem categoria"),
                 "Formato": str(product.get("formato") or ""),
                 "Situação": "Ativo" if product.get("situacao", "A") == "A" else "Inativo",
                 "Unidade": str(product.get("unidade") or "UN"),
                 "Preço": number(product.get("preco")),
+                "Custo cadastrado": number(product.get("precoCusto")),
                 "Saldo físico": physical,
                 "Saldo virtual": virtual,
+                "Consumo no período": number(consumption.get(product_id)),
             }
         )
 
@@ -270,28 +378,89 @@ def normalize_inventory(products: list[dict], balances: list[dict]) -> pd.DataFr
         return pd.DataFrame(
             columns=[
                 "ID", "Código", "Produto", "Categoria", "Formato", "Situação",
-                "Unidade", "Preço", "Saldo físico", "Saldo virtual",
+                "Unidade", "Preço", "Custo cadastrado", "Saldo físico",
+                "Saldo virtual", "Consumo no período",
             ]
         )
-    df["Valor em estoque"] = df["Preço"] * df["Saldo físico"].clip(lower=0)
+    weeks = max(analysis_days / 7, 1 / 7)
+    months = max(analysis_days / 30.4375, 1 / 30.4375)
+    df["Saldo atual"] = df["Saldo virtual"]
+    df["Consumo médio semanal"] = df["Consumo no período"] / weeks
+    df["Consumo médio mensal"] = df["Consumo no período"] / months
+    df["Cobertura (semanas)"] = df.apply(
+        lambda row: (
+            row["Saldo atual"] / row["Consumo médio semanal"]
+            if row["Consumo médio semanal"] > 0
+            else float("inf")
+        ),
+        axis=1,
+    )
+    df["Cobertura (meses)"] = df["Cobertura (semanas)"] / (30.4375 / 7)
+    df["Valor em estoque"] = (
+        df["Custo cadastrado"] * df["Saldo atual"].clip(lower=0)
+    )
+    df["Valor de consumo"] = df["Consumo no período"] * df["Custo cadastrado"]
     return df
 
 
-def load_inventory(client_id: str, client_secret: str) -> tuple[pd.DataFrame, str]:
+def load_inventory(
+    client_id: str,
+    client_secret: str,
+    start_date: date,
+    end_date: date,
+) -> tuple[pd.DataFrame, list[str], int]:
     products = fetch_all("produtos", client_id, client_secret)
-    stock_warning = ""
+    warnings: list[str] = []
+    product_ids = [int(product["id"]) for product in products if product.get("id")]
     try:
-        balances = fetch_all("estoques/saldos", client_id, client_secret)
+        balances = fetch_stock_balances(product_ids, client_id, client_secret)
     except requests.HTTPError as exc:
         balances = []
         if exc.response is not None and exc.response.status_code == 403:
-            stock_warning = (
+            warnings.append(
                 "O aplicativo não possui o escopo de leitura de estoques. "
                 "Adicione esse escopo no Bling e autorize novamente."
             )
         else:
-            stock_warning = f"Não foi possível consultar os saldos: {exc}"
-    return normalize_inventory(products, balances), stock_warning
+            detail = exc.response.text if exc.response is not None else str(exc)
+            warnings.append(f"Não foi possível consultar os saldos: {detail}")
+
+    try:
+        product_categories = fetch_product_categories(
+            products, client_id, client_secret
+        )
+    except requests.RequestException as exc:
+        product_categories = {}
+        warnings.append(f"Não foi possível consultar as categorias: {exc}")
+
+    try:
+        consumption, order_count, sales_warnings = fetch_sales_consumption(
+            start_date, end_date, client_id, client_secret
+        )
+        warnings.extend(sales_warnings)
+    except requests.HTTPError as exc:
+        consumption, order_count = {}, 0
+        if exc.response is not None and exc.response.status_code == 403:
+            warnings.append(
+                "O aplicativo não possui leitura de pedidos de venda. Adicione "
+                "esse escopo e autorize novamente para calcular consumo, giro e ABC."
+            )
+        else:
+            detail = exc.response.text if exc.response is not None else str(exc)
+            warnings.append(f"Não foi possível calcular o consumo: {detail}")
+
+    analysis_days = max((end_date - start_date).days + 1, 1)
+    return (
+        normalize_inventory(
+            products,
+            balances,
+            product_categories,
+            consumption,
+            analysis_days,
+        ),
+        warnings,
+        order_count,
+    )
 
 
 def br_number(value: float, decimals: int = 0) -> str:
@@ -337,25 +506,45 @@ def login_page(client_id: str, client_secret: str) -> None:
 def dashboard(client_id: str, client_secret: str) -> None:
     with st.sidebar:
         st.title("Ultra Loot")
-        st.caption("Gestão de estoque")
-        low_limit = st.number_input(
-            "Limite de estoque baixo", min_value=1, value=5, step=1
+        st.caption("Estoque, consumo e reposição")
+        analysis_days = st.selectbox(
+            "Período para consumo", [30, 60, 90, 180], index=2,
+            format_func=lambda value: f"Últimos {value} dias",
+        )
+        target_weeks = st.number_input(
+            "Cobertura desejada (semanas)",
+            min_value=1.0,
+            max_value=52.0,
+            value=4.0,
+            step=1.0,
+            help="Quantidade de semanas que o estoque deve suportar.",
         )
         if st.button("Atualizar dados", type="primary", use_container_width=True):
             st.session_state.pop("inventory", None)
-            st.session_state.pop("stock_warning", None)
+            st.session_state.pop("inventory_period", None)
         st.divider()
         if st.button("Desconectar", use_container_width=True):
-            for key in ["bling_tokens", "inventory", "stock_warning"]:
+            for key in ["bling_tokens", "inventory", "inventory_warnings"]:
                 st.session_state.pop(key, None)
             st.rerun()
 
+    if st.session_state.get("inventory_period") != analysis_days:
+        st.session_state.pop("inventory", None)
+
+    end_date = date.today()
+    start_date = end_date - timedelta(days=analysis_days - 1)
     if "inventory" not in st.session_state:
         try:
-            with st.spinner("Sincronizando produtos e saldos com o Bling..."):
-                inventory, warning = load_inventory(client_id, client_secret)
+            with st.spinner(
+                "Sincronizando produtos, categorias, saldos e vendas com o Bling..."
+            ):
+                inventory, warnings, order_count = load_inventory(
+                    client_id, client_secret, start_date, end_date
+                )
                 st.session_state.inventory = inventory
-                st.session_state.stock_warning = warning
+                st.session_state.inventory_warnings = warnings
+                st.session_state.order_count = order_count
+                st.session_state.inventory_period = analysis_days
                 st.session_state.updated_at = datetime.now(
                     timezone(timedelta(hours=-3))
                 )
@@ -365,37 +554,69 @@ def dashboard(client_id: str, client_secret: str) -> None:
             return
 
     df = st.session_state.inventory.copy()
-    warning = st.session_state.get("stock_warning", "")
+    warnings = st.session_state.get("inventory_warnings", [])
     updated_at = st.session_state.get("updated_at")
+    order_count = st.session_state.get("order_count", 0)
 
     st.title("📦 Dashboard de Estoque")
     timestamp = updated_at.strftime("%d/%m/%Y às %H:%M") if updated_at else "agora"
     st.markdown(
-        f'<p class="ul-subtitle">Posição sincronizada em {timestamp}</p>',
+        f'<p class="ul-subtitle">Posição em {timestamp} · Consumo de '
+        f'{start_date:%d/%m/%Y} a {end_date:%d/%m/%Y} · {order_count} pedidos</p>',
         unsafe_allow_html=True,
     )
-    if warning:
+    for warning in warnings:
         st.warning(warning)
     if df.empty:
         st.info("Nenhum produto foi retornado pela API.")
         return
 
-    df["Status do estoque"] = "Normal"
-    df.loc[df["Saldo físico"] <= low_limit, "Status do estoque"] = "Estoque baixo"
-    df.loc[df["Saldo físico"] <= 0, "Status do estoque"] = "Sem estoque"
+    df["Status de reposição"] = "Saudável"
+    df.loc[df["Consumo médio semanal"] <= 0, "Status de reposição"] = "Sem consumo"
+    df.loc[
+        (df["Consumo médio semanal"] > 0)
+        & (df["Cobertura (semanas)"] <= target_weeks * 1.5),
+        "Status de reposição",
+    ] = "Atenção"
+    df.loc[
+        (df["Consumo médio semanal"] > 0)
+        & (df["Cobertura (semanas)"] <= target_weeks),
+        "Status de reposição",
+    ] = "Repor"
+    df.loc[
+        (df["Consumo médio semanal"] > 0) & (df["Saldo atual"] <= 0),
+        "Status de reposição",
+    ] = "Reposição urgente"
+    df["Sugestão de compra"] = (
+        df["Consumo médio semanal"] * target_weeks - df["Saldo atual"]
+    ).clip(lower=0)
+
+    abc_base = df["Valor de consumo"].clip(lower=0)
+    total_consumption_value = abc_base.sum()
+    if total_consumption_value > 0:
+        cumulative = abc_base.sort_values(ascending=False).cumsum() / total_consumption_value
+        previous = cumulative.shift(fill_value=0)
+        abc = pd.Series("C", index=df.index)
+        abc.loc[previous[previous < 0.80].index] = "A"
+        abc.loc[previous[(previous >= 0.80) & (previous < 0.95)].index] = "B"
+        df["Curva ABC"] = abc
+    else:
+        df["Curva ABC"] = "Sem classificação"
 
     with st.expander("Filtros", expanded=True):
-        f1, f2, f3, f4 = st.columns([2.2, 1.3, 1.3, 1.3])
+        f1, f2, f3, f4, f5 = st.columns([2.2, 1.1, 1.4, 1.3, 1.0])
         search = f1.text_input("Buscar produto ou código", placeholder="Digite para pesquisar")
         situations = f2.multiselect(
             "Situação", sorted(df["Situação"].unique()), default=["Ativo"]
         )
-        stock_status = f3.multiselect(
-            "Status do estoque", ["Normal", "Estoque baixo", "Sem estoque"]
+        replenishment_status = f3.multiselect(
+            "Reposição",
+            ["Reposição urgente", "Repor", "Atenção", "Saudável", "Sem consumo"],
         )
         categories = f4.multiselect(
             "Categoria", sorted(df["Categoria"].astype(str).unique())
         )
+        abc_filter = f5.multiselect("Curva ABC", ["A", "B", "C"])
 
     filtered = df.copy()
     if search:
@@ -406,79 +627,119 @@ def dashboard(client_id: str, client_secret: str) -> None:
         filtered = filtered[mask]
     if situations:
         filtered = filtered[filtered["Situação"].isin(situations)]
-    if stock_status:
-        filtered = filtered[filtered["Status do estoque"].isin(stock_status)]
+    if replenishment_status:
+        filtered = filtered[
+            filtered["Status de reposição"].isin(replenishment_status)
+        ]
     if categories:
         filtered = filtered[filtered["Categoria"].isin(categories)]
+    if abc_filter:
+        filtered = filtered[filtered["Curva ABC"].isin(abc_filter)]
 
     active = filtered[filtered["Situação"] == "Ativo"]
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("SKUs ativos", br_number(active["ID"].nunique()))
-    k2.metric("Unidades físicas", br_number(active["Saldo físico"].sum(), 1))
-    k3.metric("Sem estoque", br_number((active["Saldo físico"] <= 0).sum()))
-    k4.metric(
-        "Estoque baixo",
-        br_number(((active["Saldo físico"] > 0) & (active["Saldo físico"] <= low_limit)).sum()),
+    k2.metric("Saldo atual", br_number(active["Saldo atual"].sum(), 1))
+    k3.metric(
+        "Reposição urgente",
+        br_number((active["Status de reposição"] == "Reposição urgente").sum()),
     )
-    k5.metric("Valor potencial", br_currency(active["Valor em estoque"].sum()))
+    k4.metric(
+        "Itens para repor",
+        br_number(active["Status de reposição"].isin(["Repor", "Reposição urgente"]).sum()),
+    )
+    k5.metric("Valor do estoque", br_currency(active["Valor em estoque"].sum()))
 
     st.subheader("Visão geral")
-    chart1, chart2 = st.columns([1, 1.8])
+    chart1, chart2, chart3 = st.columns([1, 1, 1.6])
     status_summary = (
-        active.groupby("Status do estoque", as_index=False)["ID"]
+        active.groupby("Status de reposição", as_index=False)["ID"]
         .count()
         .rename(columns={"ID": "Produtos"})
     )
     fig_status = px.pie(
         status_summary,
-        names="Status do estoque",
+        names="Status de reposição",
         values="Produtos",
         hole=0.62,
-        color="Status do estoque",
+        color="Status de reposição",
         color_discrete_map={
-            "Normal": "#6d28d9",
-            "Estoque baixo": "#f59e0b",
-            "Sem estoque": "#ef4444",
+            "Saudável": "#22c55e",
+            "Atenção": "#f59e0b",
+            "Repor": "#f97316",
+            "Reposição urgente": "#ef4444",
+            "Sem consumo": "#64748b",
         },
     )
     fig_status.update_layout(margin=dict(l=10, r=10, t=25, b=10), legend_title="")
     chart1.plotly_chart(fig_status, use_container_width=True)
 
-    top = active.nlargest(12, "Saldo físico").sort_values("Saldo físico")
+    abc_summary = (
+        active[active["Curva ABC"].isin(["A", "B", "C"])]
+        .groupby("Curva ABC", as_index=False)["Valor de consumo"]
+        .sum()
+    )
+    fig_abc = px.pie(
+        abc_summary,
+        names="Curva ABC",
+        values="Valor de consumo",
+        hole=0.62,
+        category_orders={"Curva ABC": ["A", "B", "C"]},
+        color="Curva ABC",
+        color_discrete_map={"A": "#6d28d9", "B": "#f97316", "C": "#94a3b8"},
+    )
+    fig_abc.update_layout(margin=dict(l=10, r=10, t=25, b=10), legend_title="Curva")
+    chart2.plotly_chart(fig_abc, use_container_width=True)
+
+    top = active.nlargest(12, "Consumo médio mensal").sort_values("Consumo médio mensal")
     fig_top = px.bar(
         top,
-        x="Saldo físico",
+        x="Consumo médio mensal",
         y="Produto",
         orientation="h",
-        color="Saldo físico",
-        color_continuous_scale=["#ddd6fe", "#6d28d9"],
+        color="Curva ABC",
+        color_discrete_map={"A": "#6d28d9", "B": "#f97316", "C": "#94a3b8"},
     )
     fig_top.update_layout(
         margin=dict(l=10, r=10, t=25, b=10),
-        coloraxis_showscale=False,
         yaxis_title="",
+        legend_title="Curva",
     )
-    chart2.plotly_chart(fig_top, use_container_width=True)
+    chart3.plotly_chart(fig_top, use_container_width=True)
 
     st.subheader("Produtos")
     display_columns = [
-        "Código", "Produto", "Categoria", "Situação", "Saldo físico",
-        "Saldo virtual", "Status do estoque", "Preço", "Valor em estoque",
+        "Código", "Produto", "Categoria", "Curva ABC", "Saldo atual",
+        "Custo cadastrado", "Consumo médio semanal", "Consumo médio mensal",
+        "Cobertura (semanas)", "Cobertura (meses)", "Status de reposição",
+        "Sugestão de compra", "Valor em estoque",
     ]
+    display_df = filtered[display_columns].copy()
+    display_df["Cobertura (semanas)"] = display_df["Cobertura (semanas)"].replace(
+        [float("inf")], None
+    )
+    display_df["Cobertura (meses)"] = display_df["Cobertura (meses)"].replace(
+        [float("inf")], None
+    )
     st.dataframe(
-        filtered[display_columns].sort_values(
-            ["Saldo físico", "Produto"], ascending=[True, True]
+        display_df.sort_values(
+            ["Status de reposição", "Cobertura (semanas)", "Produto"],
+            ascending=[True, True, True],
         ),
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Preço": st.column_config.NumberColumn(format="R$ %.2f"),
+            "Custo cadastrado": st.column_config.NumberColumn(format="R$ %.2f"),
             "Valor em estoque": st.column_config.NumberColumn(format="R$ %.2f"),
-            "Saldo físico": st.column_config.NumberColumn(format="%.2f"),
-            "Saldo virtual": st.column_config.NumberColumn(format="%.2f"),
+            "Saldo atual": st.column_config.NumberColumn(format="%.2f"),
+            "Consumo médio semanal": st.column_config.NumberColumn(format="%.2f"),
+            "Consumo médio mensal": st.column_config.NumberColumn(format="%.2f"),
+            "Cobertura (semanas)": st.column_config.NumberColumn(format="%.1f"),
+            "Cobertura (meses)": st.column_config.NumberColumn(format="%.1f"),
+            "Sugestão de compra": st.column_config.NumberColumn(format="%.1f"),
         },
     )
-    csv = filtered[display_columns].to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+    csv = display_df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
     st.download_button(
         "Baixar estoque filtrado (CSV)",
         csv,
