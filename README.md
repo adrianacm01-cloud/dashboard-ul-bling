@@ -1,7 +1,7 @@
-# Validação da API do Bling
+# Dashboard de Estoque Ultra Loot
 
-Aplicativo Streamlit mínimo para executar o OAuth 2.0 do Bling e validar uma
-consulta de leitura ao endpoint de produtos.
+Dashboard Streamlit integrado à API v3 do Bling por OAuth 2.0. Consulta
+produtos e saldos, apresenta indicadores, filtros, gráficos e exportação CSV.
 
 ## Publicação
 
@@ -16,11 +16,12 @@ BLING_CLIENT_ID = "..."
 BLING_CLIENT_SECRET = "..."
 ```
 
-6. No Bling, adicione ao menos o escopo de leitura de produtos e salve o app.
-7. Abra o Streamlit, autorize a conta e teste a consulta.
+6. No Bling, adicione os escopos de leitura de produtos e estoques e salve o app.
+7. Abra o Streamlit e autorize a conta.
 
 ## Segurança
 
 O `client_secret`, o `access_token` e o `refresh_token` nunca devem ser
-commitados no GitHub. Esta versão mantém os tokens somente na sessão e serve
-apenas para validar a integração.
+commitados no GitHub. Esta versão mantém os tokens somente na sessão. Uma etapa
+posterior deve persistir os tokens criptografados para dispensar nova
+autorização após o encerramento da sessão.
