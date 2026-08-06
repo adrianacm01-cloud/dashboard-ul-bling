@@ -192,31 +192,57 @@ def fetch_stock_balances(
     return balances
 
 
-def fetch_product_categories(
+def fetch_product_metadata(
     products: list[dict], client_id: str, client_secret: str
-) -> dict[int, str]:
-    categories = fetch_all("categorias/produtos", client_id, client_secret)
+) -> tuple[dict[int, str], dict[int, float], list[str]]:
+    warnings: list[str] = []
+    try:
+        categories = fetch_all("categorias/produtos", client_id, client_secret)
+    except requests.RequestException as exc:
+        categories = []
+        warnings.append(f"Não foi possível listar as categorias: {exc}")
     category_names = {
         int(item["id"]): str(item.get("descricao") or "Sem categoria")
         for item in categories
         if item.get("id") is not None
     }
     product_categories: dict[int, str] = {}
+    product_costs: dict[int, float] = {}
+    failed = 0
     progress = st.progress(0, text="Carregando categorias dos produtos...")
     total = max(len(products), 1)
     for index, product in enumerate(products, start=1):
         product_id = int(product.get("id", 0) or 0)
-        detail = api_get(
-            f"produtos/{product_id}", {}, client_id, client_secret
-        ).get("data", {})
+        try:
+            detail = api_get(
+                f"produtos/{product_id}", {}, client_id, client_secret
+            ).get("data", {})
+        except requests.RequestException:
+            failed += 1
+            progress.progress(index / total, text="Carregando categorias e custos...")
+            continue
         category_id = nested_value(detail, "categoria.id")
         product_categories[product_id] = category_names.get(
             int(category_id) if category_id is not None else 0,
             "Sem categoria",
         )
-        progress.progress(index / total, text="Carregando categorias dos produtos...")
+        product_costs[product_id] = number(
+            nested_value(
+                detail,
+                "precoCusto",
+                "fornecedor.precoCusto",
+                "fornecedor.precoCompra",
+                default=product.get("precoCusto"),
+            )
+        )
+        progress.progress(index / total, text="Carregando categorias e custos...")
     progress.empty()
-    return product_categories
+    if failed:
+        warnings.append(
+            f"{failed} produto(s) não puderam ter os detalhes consultados; "
+            "eles permaneceram sem categoria/custo detalhado."
+        )
+    return product_categories, product_costs, warnings
 
 
 def fetch_sales_consumption(
@@ -224,7 +250,7 @@ def fetch_sales_consumption(
     end_date: date,
     client_id: str,
     client_secret: str,
-) -> tuple[dict[int, float], int, list[str]]:
+) -> tuple[dict[int, float], int, int, list[str]]:
     orders = fetch_all(
         "pedidos/vendas",
         client_id,
@@ -252,12 +278,19 @@ def fetch_sales_consumption(
             valid_orders.append(order)
 
     consumption: dict[int, float] = {}
+    item_count = 0
+    failed_orders = 0
     progress = st.progress(0, text="Calculando consumo pelos pedidos de venda...")
     total = max(len(valid_orders), 1)
     for index, order in enumerate(valid_orders, start=1):
-        detail = api_get(
-            f"pedidos/vendas/{int(order['id'])}", {}, client_id, client_secret
-        ).get("data", {})
+        try:
+            detail = api_get(
+                f"pedidos/vendas/{int(order['id'])}", {}, client_id, client_secret
+            ).get("data", {})
+        except requests.RequestException:
+            failed_orders += 1
+            progress.progress(index / total, text="Calculando consumo pelos pedidos de venda...")
+            continue
         for item in detail.get("itens", []):
             product_id = nested_value(item, "produto.id")
             if product_id is not None:
@@ -265,6 +298,7 @@ def fetch_sales_consumption(
                 consumption[product_id] = consumption.get(product_id, 0.0) + number(
                     item.get("quantidade")
                 )
+                item_count += 1
         progress.progress(index / total, text="Calculando consumo pelos pedidos de venda...")
     progress.empty()
     if orders and not any(situation_names.values()):
@@ -272,7 +306,12 @@ def fetch_sales_consumption(
             "Não foi possível identificar os nomes das situações; os pedidos "
             "cancelados podem estar incluídos no consumo."
         )
-    return consumption, len(valid_orders), warnings
+    if failed_orders:
+        warnings.append(
+            f"{failed_orders} pedido(s) não puderam ser detalhados e foram "
+            "ignorados no cálculo de consumo."
+        )
+    return consumption, len(valid_orders), item_count, warnings
 
 
 def nested_value(item: dict, *paths, default=None):
@@ -325,6 +364,7 @@ def normalize_inventory(
     products: list[dict],
     balances: list[dict],
     product_categories: dict[int, str],
+    product_costs: dict[int, float],
     consumption: dict[int, float],
     analysis_days: int,
 ) -> pd.DataFrame:
@@ -366,7 +406,9 @@ def normalize_inventory(
                 "Situação": "Ativo" if product.get("situacao", "A") == "A" else "Inativo",
                 "Unidade": str(product.get("unidade") or "UN"),
                 "Preço": number(product.get("preco")),
-                "Custo cadastrado": number(product.get("precoCusto")),
+                "Custo cadastrado": number(
+                    product_costs.get(product_id, product.get("precoCusto"))
+                ),
                 "Saldo físico": physical,
                 "Saldo virtual": virtual,
                 "Consumo no período": number(consumption.get(product_id)),
@@ -408,8 +450,10 @@ def load_inventory(
     client_secret: str,
     start_date: date,
     end_date: date,
-) -> tuple[pd.DataFrame, list[str], int]:
-    products = fetch_all("produtos", client_id, client_secret)
+) -> tuple[pd.DataFrame, list[str], int, dict]:
+    products = fetch_all(
+        "produtos", client_id, client_secret, {"criterio": 5}
+    )
     warnings: list[str] = []
     product_ids = [int(product["id"]) for product in products if product.get("id")]
     try:
@@ -425,21 +469,21 @@ def load_inventory(
             detail = exc.response.text if exc.response is not None else str(exc)
             warnings.append(f"Não foi possível consultar os saldos: {detail}")
 
-    try:
-        product_categories = fetch_product_categories(
-            products, client_id, client_secret
-        )
-    except requests.RequestException as exc:
-        product_categories = {}
-        warnings.append(f"Não foi possível consultar as categorias: {exc}")
+    active_products = [
+        product for product in products if product.get("situacao", "A") == "A"
+    ]
+    product_categories, product_costs, metadata_warnings = fetch_product_metadata(
+        active_products, client_id, client_secret
+    )
+    warnings.extend(metadata_warnings)
 
     try:
-        consumption, order_count, sales_warnings = fetch_sales_consumption(
+        consumption, order_count, item_count, sales_warnings = fetch_sales_consumption(
             start_date, end_date, client_id, client_secret
         )
         warnings.extend(sales_warnings)
     except requests.HTTPError as exc:
-        consumption, order_count = {}, 0
+        consumption, order_count, item_count = {}, 0, 0
         if exc.response is not None and exc.response.status_code == 403:
             warnings.append(
                 "O aplicativo não possui leitura de pedidos de venda. Adicione "
@@ -455,11 +499,23 @@ def load_inventory(
             products,
             balances,
             product_categories,
+            product_costs,
             consumption,
             analysis_days,
         ),
         warnings,
         order_count,
+        {
+            "Produtos": len(products),
+            "Produtos ativos detalhados": len(active_products),
+            "Categorias identificadas": sum(
+                value != "Sem categoria" for value in product_categories.values()
+            ),
+            "Custos maiores que zero": sum(value > 0 for value in product_costs.values()),
+            "Pedidos considerados": order_count,
+            "Itens de pedidos considerados": item_count,
+            "Produtos com consumo": sum(value > 0 for value in consumption.values()),
+        },
     )
 
 
@@ -475,7 +531,7 @@ def load_basic_inventory(
         client_secret,
         {"criterio": 5},
     )
-    return normalize_inventory(products, [], {}, {}, analysis_days)
+    return normalize_inventory(products, [], {}, {}, {}, analysis_days)
 
 
 def br_number(value: float, decimals: int = 0) -> str:
@@ -566,6 +622,16 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 st.session_state.inventory = inventory
                 st.session_state.inventory_warnings = []
                 st.session_state.order_count = 0
+                st.session_state.sync_diagnostics = {
+                    "Produtos": len(inventory),
+                    "Categorias identificadas": 0,
+                    "Custos maiores que zero": int(
+                        (inventory["Custo cadastrado"] > 0).sum()
+                    ),
+                    "Pedidos considerados": 0,
+                    "Itens de pedidos considerados": 0,
+                    "Produtos com consumo": 0,
+                }
                 st.session_state.inventory_period = analysis_days
                 st.session_state.analytics_loaded = False
                 st.session_state.updated_at = datetime.now(
@@ -581,12 +647,13 @@ def dashboard(client_id: str, client_secret: str) -> None:
             with st.spinner(
                 "Sincronizando categorias e consumo. Você pode aguardar nesta página..."
             ):
-                inventory, warnings, order_count = load_inventory(
+                inventory, warnings, order_count, diagnostics = load_inventory(
                     client_id, client_secret, start_date, end_date
                 )
                 st.session_state.inventory = inventory
                 st.session_state.inventory_warnings = warnings
                 st.session_state.order_count = order_count
+                st.session_state.sync_diagnostics = diagnostics
                 st.session_state.inventory_period = analysis_days
                 st.session_state.analytics_loaded = True
                 st.session_state.updated_at = datetime.now(
@@ -620,6 +687,17 @@ def dashboard(client_id: str, client_secret: str) -> None:
     )
     for warning in warnings:
         st.warning(warning)
+    with st.expander("Diagnóstico da sincronização", expanded=False):
+        diagnostics = st.session_state.get("sync_diagnostics", {})
+        if diagnostics:
+            diagnostic_df = pd.DataFrame(
+                diagnostics.items(), columns=["Dado", "Quantidade"]
+            )
+            st.dataframe(diagnostic_df, hide_index=True, use_container_width=True)
+        st.caption(
+            "Se categorias, custos ou itens aparecerem zerados após a sincronização, "
+            "a origem não foi retornada pela API ou falta permissão para o recurso."
+        )
     if df.empty:
         st.info("Nenhum produto foi retornado pela API.")
         return
