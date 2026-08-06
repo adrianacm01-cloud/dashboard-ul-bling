@@ -4,6 +4,11 @@ Dashboard Streamlit integrado à API v3 do Bling por OAuth 2.0. Consulta
 produtos, categorias, saldos e pedidos de venda. Apresenta consumo médio,
 cobertura de estoque, curva ABC, alertas de reposição, filtros e exportação CSV.
 
+O primeiro carregamento usa somente a listagem paginada de produtos para abrir
+rapidamente com saldo virtual e custo. Categorias e consumo são atualizados sob
+demanda pelo botão **Sincronizar consumo e categorias**, pois o Bling exige uma
+consulta individual para cada produto e pedido.
+
 ## Publicação
 
 1. Publique este repositório no GitHub sem adicionar `secrets.toml`.
@@ -38,3 +43,6 @@ autorização após o encerramento da sessão.
 - Curva ABC: participação acumulada no valor de consumo (`quantidade × custo`),
   com faixas A até 80%, B até 95% e C para o restante.
 - Reposição: compara a cobertura atual com as semanas desejadas no painel.
+- Inativo no dashboard: marca local de visualização que remove o produto dos
+  indicadores, gráficos e alertas sem alterar o cadastro no Bling. Enquanto não
+  houver banco de dados, a marca permanece somente durante a sessão.
