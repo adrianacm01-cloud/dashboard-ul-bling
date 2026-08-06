@@ -463,6 +463,21 @@ def load_inventory(
     )
 
 
+def load_basic_inventory(
+    client_id: str,
+    client_secret: str,
+    analysis_days: int,
+) -> pd.DataFrame:
+    """Fast first paint: the product list already includes virtual stock and cost."""
+    products = fetch_all(
+        "produtos",
+        client_id,
+        client_secret,
+        {"criterio": 5},
+    )
+    return normalize_inventory(products, [], {}, {}, analysis_days)
+
+
 def br_number(value: float, decimals: int = 0) -> str:
     text = f"{value:,.{decimals}f}"
     return text.replace(",", "X").replace(".", ",").replace("X", ".")
@@ -519,32 +534,40 @@ def dashboard(client_id: str, client_secret: str) -> None:
             step=1.0,
             help="Quantidade de semanas que o estoque deve suportar.",
         )
-        if st.button("Atualizar dados", type="primary", use_container_width=True):
+        if st.button("Atualizar saldo", type="primary", use_container_width=True):
             st.session_state.pop("inventory", None)
-            st.session_state.pop("inventory_period", None)
+            st.session_state.analytics_loaded = False
+        run_analytics = st.button(
+            "Sincronizar consumo e categorias",
+            use_container_width=True,
+            help=(
+                "Processo mais demorado: consulta detalhes dos produtos e dos "
+                "pedidos do período selecionado."
+            ),
+        )
+        if st.session_state.get("analytics_loaded"):
+            st.success("Análise sincronizada")
+        else:
+            st.caption("Saldo rápido ativo · análise ainda não sincronizada")
         st.divider()
         if st.button("Desconectar", use_container_width=True):
             for key in ["bling_tokens", "inventory", "inventory_warnings"]:
                 st.session_state.pop(key, None)
             st.rerun()
 
-    if st.session_state.get("inventory_period") != analysis_days:
-        st.session_state.pop("inventory", None)
-
     end_date = date.today()
     start_date = end_date - timedelta(days=analysis_days - 1)
     if "inventory" not in st.session_state:
         try:
-            with st.spinner(
-                "Sincronizando produtos, categorias, saldos e vendas com o Bling..."
-            ):
-                inventory, warnings, order_count = load_inventory(
-                    client_id, client_secret, start_date, end_date
+            with st.spinner("Carregando produtos e saldo atual..."):
+                inventory = load_basic_inventory(
+                    client_id, client_secret, analysis_days
                 )
                 st.session_state.inventory = inventory
-                st.session_state.inventory_warnings = warnings
-                st.session_state.order_count = order_count
+                st.session_state.inventory_warnings = []
+                st.session_state.order_count = 0
                 st.session_state.inventory_period = analysis_days
+                st.session_state.analytics_loaded = False
                 st.session_state.updated_at = datetime.now(
                     timezone(timedelta(hours=-3))
                 )
@@ -553,6 +576,27 @@ def dashboard(client_id: str, client_secret: str) -> None:
             st.error(f"Falha ao consultar a API do Bling: {detail}")
             return
 
+    if run_analytics:
+        try:
+            with st.spinner(
+                "Sincronizando categorias e consumo. Você pode aguardar nesta página..."
+            ):
+                inventory, warnings, order_count = load_inventory(
+                    client_id, client_secret, start_date, end_date
+                )
+                st.session_state.inventory = inventory
+                st.session_state.inventory_warnings = warnings
+                st.session_state.order_count = order_count
+                st.session_state.inventory_period = analysis_days
+                st.session_state.analytics_loaded = True
+                st.session_state.updated_at = datetime.now(
+                    timezone(timedelta(hours=-3))
+                )
+            st.rerun()
+        except requests.RequestException as exc:
+            detail = exc.response.text if exc.response is not None else str(exc)
+            st.error(f"Falha na sincronização analítica: {detail}")
+
     df = st.session_state.inventory.copy()
     warnings = st.session_state.get("inventory_warnings", [])
     updated_at = st.session_state.get("updated_at")
@@ -560,9 +604,18 @@ def dashboard(client_id: str, client_secret: str) -> None:
 
     st.title("📦 Dashboard de Estoque")
     timestamp = updated_at.strftime("%d/%m/%Y às %H:%M") if updated_at else "agora"
+    if st.session_state.get("analytics_loaded"):
+        subtitle = (
+            f"Posição em {timestamp} · Consumo de {start_date:%d/%m/%Y} "
+            f"a {end_date:%d/%m/%Y} · {order_count} pedidos"
+        )
+    else:
+        subtitle = (
+            f"Saldo atualizado em {timestamp} · Clique em “Sincronizar consumo "
+            "e categorias” quando precisar atualizar as análises"
+        )
     st.markdown(
-        f'<p class="ul-subtitle">Posição em {timestamp} · Consumo de '
-        f'{start_date:%d/%m/%Y} a {end_date:%d/%m/%Y} · {order_count} pedidos</p>',
+        f'<p class="ul-subtitle">{subtitle}</p>',
         unsafe_allow_html=True,
     )
     for warning in warnings:
@@ -602,6 +655,51 @@ def dashboard(client_id: str, client_secret: str) -> None:
         df["Curva ABC"] = abc
     else:
         df["Curva ABC"] = "Sem classificação"
+
+    inactive_ids = set(st.session_state.get("dashboard_inactive_products", []))
+    with st.expander(
+        f"Gerenciar produtos ocultos ({len(inactive_ids)})",
+        expanded=False,
+    ):
+        st.caption(
+            "Marque produtos que não devem participar dos indicadores, gráficos "
+            "e alertas. Esta ação não altera o cadastro no Bling."
+        )
+        tag_table = df[["ID", "Código", "Produto", "Categoria"]].copy()
+        tag_table.insert(
+            0,
+            "Inativo no dashboard",
+            tag_table["ID"].isin(inactive_ids),
+        )
+        edited_tags = st.data_editor(
+            tag_table,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["ID", "Código", "Produto", "Categoria"],
+            column_config={
+                "Inativo no dashboard": st.column_config.CheckboxColumn(
+                    "Inativo no dashboard",
+                    help="Oculta apenas neste dashboard; não altera o Bling.",
+                ),
+                "ID": None,
+            },
+            key="product_visibility_editor",
+        )
+        new_inactive_ids = set(
+            edited_tags.loc[
+                edited_tags["Inativo no dashboard"], "ID"
+            ].astype(int)
+        )
+        if new_inactive_ids != inactive_ids:
+            st.session_state.dashboard_inactive_products = sorted(new_inactive_ids)
+            inactive_ids = new_inactive_ids
+            st.rerun()
+
+    if inactive_ids:
+        df = df[~df["ID"].isin(inactive_ids)].copy()
+    st.caption(
+        f"{len(inactive_ids)} produto(s) marcado(s) como inativo(s) somente no dashboard."
+    )
 
     with st.expander("Filtros", expanded=True):
         f1, f2, f3, f4, f5 = st.columns([2.2, 1.1, 1.4, 1.3, 1.0])
