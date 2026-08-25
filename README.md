@@ -46,3 +46,6 @@ autorização após o encerramento da sessão.
 - Inativo no dashboard: marca local de visualização que remove o produto dos
   indicadores, gráficos e alertas sem alterar o cadastro no Bling. Enquanto não
   houver banco de dados, a marca permanece somente durante a sessão.
+- Categoria: correlacionada pelo ID interno entre a listagem de estoque e o
+  cadastro individual do produto. Variações sem categoria própria herdam a
+  categoria do produto-pai. O SKU e o nome não são usados como chave do vínculo.
