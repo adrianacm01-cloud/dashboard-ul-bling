@@ -206,8 +206,8 @@ def fetch_product_metadata(
         for item in categories
         if item.get("id") is not None
     }
-    product_categories: dict[int, str] = {}
-    product_costs: dict[int, float] = {}
+    product_details: dict[int, dict] = {}
+    product_rows = {int(item["id"]): item for item in products if item.get("id")}
     failed = 0
     progress = st.progress(0, text="Carregando categorias dos produtos...")
     total = max(len(products), 1)
@@ -221,11 +221,69 @@ def fetch_product_metadata(
             failed += 1
             progress.progress(index / total, text="Carregando categorias e custos...")
             continue
+        product_details[product_id] = detail
+        progress.progress(index / total, text="Carregando categorias e custos...")
+
+    parent_ids = {
+        int(detail.get("idProdutoPai") or product_rows[product_id].get("idProdutoPai"))
+        for product_id, detail in product_details.items()
+        if detail.get("idProdutoPai") or product_rows[product_id].get("idProdutoPai")
+    }
+    for parent_id in parent_ids - product_details.keys():
+        try:
+            product_details[parent_id] = api_get(
+                f"produtos/{parent_id}", {}, client_id, client_secret
+            ).get("data", {})
+        except requests.RequestException:
+            pass
+
+    product_categories: dict[int, str] = {}
+    product_costs: dict[int, float] = {}
+    inherited_categories = 0
+    category_ids_not_listed: set[int] = set()
+    category_detail_cache: dict[int, str] = {}
+    for product_id, product in product_rows.items():
+        detail = product_details.get(product_id, {})
         category_id = nested_value(detail, "categoria.id")
-        product_categories[product_id] = category_names.get(
-            int(category_id) if category_id is not None else 0,
-            "Sem categoria",
+        category_description = nested_value(
+            detail, "categoria.descricao", "categoria.nome"
         )
+
+        # Variations commonly inherit the category from the parent product.
+        if category_id is None:
+            parent_id = detail.get("idProdutoPai") or product.get("idProdutoPai")
+            parent_detail = product_details.get(int(parent_id or 0), {})
+            category_id = nested_value(parent_detail, "categoria.id")
+            category_description = nested_value(
+                parent_detail, "categoria.descricao", "categoria.nome"
+            )
+            if category_id is not None:
+                inherited_categories += 1
+
+        if category_id is not None:
+            category_id = int(category_id)
+            category = category_names.get(category_id) or category_description
+            if not category and category_id not in category_detail_cache:
+                try:
+                    category_data = api_get(
+                        f"categorias/produtos/{category_id}",
+                        {},
+                        client_id,
+                        client_secret,
+                    ).get("data", {})
+                    category_detail_cache[category_id] = str(
+                        category_data.get("descricao") or ""
+                    )
+                except requests.RequestException:
+                    category_detail_cache[category_id] = ""
+            category = category or category_detail_cache.get(category_id)
+            if not category:
+                category = f"Categoria {category_id}"
+                category_ids_not_listed.add(category_id)
+        else:
+            category = "Sem categoria"
+        product_categories[product_id] = str(category)
+
         product_costs[product_id] = number(
             nested_value(
                 detail,
@@ -235,12 +293,20 @@ def fetch_product_metadata(
                 default=product.get("precoCusto"),
             )
         )
-        progress.progress(index / total, text="Carregando categorias e custos...")
     progress.empty()
     if failed:
         warnings.append(
             f"{failed} produto(s) não puderam ter os detalhes consultados; "
             "eles permaneceram sem categoria/custo detalhado."
+        )
+    if inherited_categories:
+        warnings.append(
+            f"{inherited_categories} variação(ões) herdaram a categoria do produto-pai."
+        )
+    if category_ids_not_listed:
+        warnings.append(
+            "Alguns IDs de categoria vieram no cadastro dos produtos, mas não "
+            "vieram na listagem de categorias; o painel exibirá o próprio ID."
         )
     return product_categories, product_costs, warnings
 
@@ -508,8 +574,12 @@ def load_inventory(
         {
             "Produtos": len(products),
             "Produtos ativos detalhados": len(active_products),
+            "Cadastros correlacionados por ID": len(product_categories),
             "Categorias identificadas": sum(
                 value != "Sem categoria" for value in product_categories.values()
+            ),
+            "Produtos sem categoria no cadastro": sum(
+                value == "Sem categoria" for value in product_categories.values()
             ),
             "Custos maiores que zero": sum(value > 0 for value in product_costs.values()),
             "Pedidos considerados": order_count,
