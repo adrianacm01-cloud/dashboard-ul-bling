@@ -49,3 +49,6 @@ autorização após o encerramento da sessão.
 - Categoria: correlacionada pelo ID interno entre a listagem de estoque e o
   cadastro individual do produto. Variações sem categoria própria herdam a
   categoria do produto-pai. O SKU e o nome não são usados como chave do vínculo.
+- Teste de categorias: para cada categoria cadastrada, o dashboard executa a
+  mesma lógica de filtro da tela de produtos (`GET /produtos?idCategoria=...`),
+  relaciona os IDs retornados ao estoque e disponibiliza uma auditoria em CSV.
