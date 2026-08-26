@@ -194,7 +194,7 @@ def fetch_stock_balances(
 
 def fetch_product_metadata(
     products: list[dict], client_id: str, client_secret: str
-) -> tuple[dict[int, str], dict[int, float], list[str]]:
+) -> tuple[dict[int, str], dict[int, float], list[str], list[dict]]:
     warnings: list[str] = []
     try:
         categories = fetch_all("categorias/produtos", client_id, client_secret)
@@ -206,6 +206,65 @@ def fetch_product_metadata(
         for item in categories
         if item.get("id") is not None
     }
+    category_by_id = {
+        int(item["id"]): item for item in categories if item.get("id") is not None
+    }
+
+    def category_depth(category_id: int, visited: set[int] | None = None) -> int:
+        visited = visited or set()
+        if category_id in visited:
+            return 0
+        parent_id = nested_value(category_by_id.get(category_id, {}), "categoriaPai.id")
+        if parent_id is None:
+            return 0
+        return 1 + category_depth(int(parent_id), visited | {category_id})
+
+    # Reproduce Bling's product-registration filter: query products by category.
+    product_categories: dict[int, str] = {}
+    category_audit: list[dict] = []
+    categories_ordered = sorted(
+        categories, key=lambda item: category_depth(int(item.get("id", 0)))
+    )
+    category_progress = st.progress(0, text="Testando filtros de categorias no Bling...")
+    total_categories = max(len(categories_ordered), 1)
+    for index, category_item in enumerate(categories_ordered, start=1):
+        category_id = int(category_item["id"])
+        category_name = str(category_item.get("descricao") or f"Categoria {category_id}")
+        try:
+            category_products = fetch_all(
+                "produtos",
+                client_id,
+                client_secret,
+                {"criterio": 5, "idCategoria": category_id},
+            )
+            matched_ids = [
+                int(item["id"]) for item in category_products if item.get("id")
+            ]
+            for product_id in matched_ids:
+                # Children are processed after parents, so the most specific wins.
+                product_categories[product_id] = category_name
+            category_audit.append(
+                {
+                    "ID da categoria": category_id,
+                    "Categoria": category_name,
+                    "Produtos retornados pelo filtro": len(matched_ids),
+                    "Status": "OK",
+                }
+            )
+        except requests.RequestException as exc:
+            category_audit.append(
+                {
+                    "ID da categoria": category_id,
+                    "Categoria": category_name,
+                    "Produtos retornados pelo filtro": 0,
+                    "Status": f"Erro: {exc}",
+                }
+            )
+        category_progress.progress(
+            index / total_categories, text="Testando filtros de categorias no Bling..."
+        )
+    category_progress.empty()
+
     product_details: dict[int, dict] = {}
     product_rows = {int(item["id"]): item for item in products if item.get("id")}
     failed = 0
@@ -237,7 +296,6 @@ def fetch_product_metadata(
         except requests.RequestException:
             pass
 
-    product_categories: dict[int, str] = {}
     product_costs: dict[int, float] = {}
     inherited_categories = 0
     category_ids_not_listed: set[int] = set()
@@ -282,7 +340,8 @@ def fetch_product_metadata(
                 category_ids_not_listed.add(category_id)
         else:
             category = "Sem categoria"
-        product_categories[product_id] = str(category)
+        # The category filter is the primary source. Product detail is fallback.
+        product_categories.setdefault(product_id, str(category))
 
         product_costs[product_id] = number(
             nested_value(
@@ -308,7 +367,12 @@ def fetch_product_metadata(
             "Alguns IDs de categoria vieram no cadastro dos produtos, mas não "
             "vieram na listagem de categorias; o painel exibirá o próprio ID."
         )
-    return product_categories, product_costs, warnings
+    if not any(row["Produtos retornados pelo filtro"] for row in category_audit):
+        warnings.append(
+            "O teste de todos os filtros de categoria retornou zero produtos. "
+            "Consulte a auditoria de categorias para confirmar a resposta da API."
+        )
+    return product_categories, product_costs, warnings, category_audit
 
 
 def fetch_sales_consumption(
@@ -516,7 +580,7 @@ def load_inventory(
     client_secret: str,
     start_date: date,
     end_date: date,
-) -> tuple[pd.DataFrame, list[str], int, dict]:
+) -> tuple[pd.DataFrame, list[str], int, dict, list[dict]]:
     products = fetch_all(
         "produtos", client_id, client_secret, {"criterio": 5}
     )
@@ -538,9 +602,12 @@ def load_inventory(
     active_products = [
         product for product in products if product.get("situacao", "A") == "A"
     ]
-    product_categories, product_costs, metadata_warnings = fetch_product_metadata(
-        active_products, client_id, client_secret
-    )
+    (
+        product_categories,
+        product_costs,
+        metadata_warnings,
+        category_audit,
+    ) = fetch_product_metadata(active_products, client_id, client_secret)
     warnings.extend(metadata_warnings)
 
     try:
@@ -586,6 +653,7 @@ def load_inventory(
             "Itens de pedidos considerados": item_count,
             "Produtos com consumo": sum(value > 0 for value in consumption.values()),
         },
+        category_audit,
     )
 
 
@@ -662,6 +730,7 @@ def dashboard(client_id: str, client_secret: str) -> None:
         )
         if st.button("Atualizar saldo", type="primary", use_container_width=True):
             st.session_state.pop("inventory", None)
+            st.session_state.pop("category_audit", None)
             st.session_state.analytics_loaded = False
         run_analytics = st.button(
             "Sincronizar consumo e categorias",
@@ -677,7 +746,12 @@ def dashboard(client_id: str, client_secret: str) -> None:
             st.caption("Saldo rápido ativo · análise ainda não sincronizada")
         st.divider()
         if st.button("Desconectar", use_container_width=True):
-            for key in ["bling_tokens", "inventory", "inventory_warnings"]:
+            for key in [
+                "bling_tokens",
+                "inventory",
+                "inventory_warnings",
+                "category_audit",
+            ]:
                 st.session_state.pop(key, None)
             st.rerun()
 
@@ -702,6 +776,7 @@ def dashboard(client_id: str, client_secret: str) -> None:
                     "Itens de pedidos considerados": 0,
                     "Produtos com consumo": 0,
                 }
+                st.session_state.category_audit = []
                 st.session_state.inventory_period = analysis_days
                 st.session_state.analytics_loaded = False
                 st.session_state.updated_at = datetime.now(
@@ -717,13 +792,18 @@ def dashboard(client_id: str, client_secret: str) -> None:
             with st.spinner(
                 "Sincronizando categorias e consumo. Você pode aguardar nesta página..."
             ):
-                inventory, warnings, order_count, diagnostics = load_inventory(
-                    client_id, client_secret, start_date, end_date
-                )
+                (
+                    inventory,
+                    warnings,
+                    order_count,
+                    diagnostics,
+                    category_audit,
+                ) = load_inventory(client_id, client_secret, start_date, end_date)
                 st.session_state.inventory = inventory
                 st.session_state.inventory_warnings = warnings
                 st.session_state.order_count = order_count
                 st.session_state.sync_diagnostics = diagnostics
+                st.session_state.category_audit = category_audit
                 st.session_state.inventory_period = analysis_days
                 st.session_state.analytics_loaded = True
                 st.session_state.updated_at = datetime.now(
@@ -768,6 +848,24 @@ def dashboard(client_id: str, client_secret: str) -> None:
             "Se categorias, custos ou itens aparecerem zerados após a sincronização, "
             "a origem não foi retornada pela API ou falta permissão para o recurso."
         )
+    category_audit = st.session_state.get("category_audit", [])
+    if category_audit:
+        with st.expander("Auditoria dos filtros de categoria", expanded=False):
+            audit_df = pd.DataFrame(category_audit)
+            st.dataframe(
+                audit_df.sort_values(
+                    ["Produtos retornados pelo filtro", "Categoria"],
+                    ascending=[False, True],
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+            st.download_button(
+                "Baixar auditoria de categorias (CSV)",
+                audit_df.to_csv(index=False, sep=";").encode("utf-8-sig"),
+                file_name="auditoria_categorias_bling.csv",
+                mime="text/csv",
+            )
     if df.empty:
         st.info("Nenhum produto foi retornado pela API.")
         return
