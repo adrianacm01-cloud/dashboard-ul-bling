@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import secrets
 import time
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlencode
 
@@ -469,6 +470,44 @@ def number(value) -> float:
         return 0.0
 
 
+def normalize_text(value) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    return " ".join(
+        "".join(char for char in text if not unicodedata.combining(char))
+        .lower()
+        .split()
+    )
+
+
+FAST_MOVING_CATEGORIES = {
+    "cafes",
+    "energetico",
+    "energeticos",
+    "refrigerante",
+    "refrigerantes",
+    "soda",
+    "sodas",
+    "suco",
+    "sucos",
+    "agua",
+    "balas e confeitos",
+    "chocolate",
+    "chocolates",
+    "salgadinho",
+    "salgadinhos",
+    "doce",
+    "doces",
+    "salgado",
+    "salgados",
+}
+
+
+def is_fast_moving_category(category: str) -> bool:
+    normalized = normalize_text(category)
+    parts = {part.strip() for part in normalized.replace(">", "/").split("/")}
+    return bool(parts & FAST_MOVING_CATEGORIES) or normalized in FAST_MOVING_CATEGORIES
+
+
 def stock_index(balances: list[dict]) -> dict[int, dict]:
     result: dict[int, dict] = {}
     for item in balances:
@@ -578,6 +617,79 @@ def normalize_inventory(
     )
     df["Valor de consumo"] = df["Consumo no período"] * df["Custo cadastrado"]
     return df
+
+
+def apply_consumption(
+    inventory: pd.DataFrame,
+    consumption: dict[int, float],
+    analysis_days: int,
+) -> pd.DataFrame:
+    df = inventory.copy()
+    weeks = max(analysis_days / 7, 1 / 7)
+    months = max(analysis_days / 30.4375, 1 / 30.4375)
+    df["Consumo no período"] = df["ID"].map(consumption).fillna(0.0)
+    df["Consumo médio semanal"] = df["Consumo no período"] / weeks
+    df["Consumo médio mensal"] = df["Consumo no período"] / months
+    df["Cobertura (semanas)"] = df.apply(
+        lambda row: (
+            row["Saldo atual"] / row["Consumo médio semanal"]
+            if row["Consumo médio semanal"] > 0
+            else float("inf")
+        ),
+        axis=1,
+    )
+    df["Cobertura (meses)"] = df["Cobertura (semanas)"] / (30.4375 / 7)
+    df["Valor de consumo"] = df["Consumo no período"] * df["Custo cadastrado"]
+    return df
+
+
+def classify_replenishment(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    result["Política de reposição"] = result["Categoria"].apply(
+        lambda value: "Consumo" if is_fast_moving_category(value) else "Quantidade"
+    )
+    result["Criticidade"] = "Adequado"
+    result["Motivo do alerta"] = "Estoque dentro do parâmetro"
+    result["Sugestão de compra"] = 0.0
+
+    fast = result["Política de reposição"] == "Consumo"
+    has_consumption = result["Consumo médio mensal"] > 0
+    critical_fast = (
+        fast
+        & has_consumption
+        & (result["Saldo atual"] <= result["Consumo médio semanal"])
+    )
+    attention_fast = (
+        fast
+        & has_consumption
+        & ~critical_fast
+        & (result["Saldo atual"] < result["Consumo médio mensal"])
+    )
+    result.loc[attention_fast, "Criticidade"] = "Atenção"
+    result.loc[attention_fast, "Motivo do alerta"] = "Abaixo do consumo médio mensal"
+    result.loc[critical_fast, "Criticidade"] = "Crítico"
+    result.loc[critical_fast, "Motivo do alerta"] = "Até um consumo médio semanal"
+    result.loc[fast & has_consumption, "Sugestão de compra"] = (
+        result.loc[fast & has_consumption, "Consumo médio mensal"]
+        - result.loc[fast & has_consumption, "Saldo atual"]
+    ).clip(lower=0)
+
+    # If there is no sales history, keep a safe quantity fallback.
+    quantity_policy = ~fast | ~has_consumption
+    critical_quantity = quantity_policy & (result["Saldo atual"] < 5)
+    attention_quantity = (
+        quantity_policy
+        & ~critical_quantity
+        & (result["Saldo atual"] <= 10)
+    )
+    result.loc[attention_quantity, "Criticidade"] = "Atenção"
+    result.loc[attention_quantity, "Motivo do alerta"] = "Saldo entre 5 e 10 unidades"
+    result.loc[critical_quantity, "Criticidade"] = "Crítico"
+    result.loc[critical_quantity, "Motivo do alerta"] = "Saldo menor que 5 unidades"
+    result.loc[quantity_policy, "Sugestão de compra"] = (
+        10 - result.loc[quantity_policy, "Saldo atual"]
+    ).clip(lower=0)
+    return result
 
 
 def load_inventory(
@@ -722,16 +834,11 @@ def dashboard(client_id: str, client_secret: str) -> None:
         st.title("Ultra Loot")
         st.caption("Estoque, consumo e reposição")
         analysis_days = st.selectbox(
-            "Período para consumo", [30, 60, 90, 180], index=2,
+            "Período para consumo", [30, 60, 90, 180], index=0,
             format_func=lambda value: f"Últimos {value} dias",
         )
-        target_weeks = st.number_input(
-            "Cobertura desejada (semanas)",
-            min_value=1.0,
-            max_value=52.0,
-            value=4.0,
-            step=1.0,
-            help="Quantidade de semanas que o estoque deve suportar.",
+        st.caption(
+            "Alto giro: alerta abaixo do consumo mensal e crítico até o consumo semanal."
         )
         if st.button("Atualizar saldo", type="primary", use_container_width=True):
             st.session_state.pop("inventory", None)
@@ -744,15 +851,14 @@ def dashboard(client_id: str, client_secret: str) -> None:
             help="Consulta as categorias e seus produtos sem carregar pedidos ou custos.",
         )
         run_analytics = st.button(
-            "Sincronizar consumo e custos",
+            "Sincronizar consumo",
             use_container_width=True,
             help=(
-                "Processo mais demorado: consulta detalhes dos produtos e dos "
-                "pedidos do período selecionado."
+                "Consulta os pedidos do período para calcular médias e criticidade."
             ),
         )
         if st.session_state.get("analytics_loaded"):
-            st.success("Consumo e custos sincronizados")
+            st.success("Consumo sincronizado")
         elif st.session_state.get("categories_loaded"):
             st.success("Categorias sincronizadas")
         else:
@@ -772,6 +878,16 @@ def dashboard(client_id: str, client_secret: str) -> None:
 
     end_date = date.today()
     start_date = end_date - timedelta(days=analysis_days - 1)
+    if (
+        st.session_state.get("analytics_loaded")
+        and st.session_state.get("inventory_period") != analysis_days
+        and "inventory" in st.session_state
+    ):
+        st.session_state.inventory = apply_consumption(
+            st.session_state.inventory, {}, analysis_days
+        )
+        st.session_state.analytics_loaded = False
+        st.session_state.order_count = 0
     if "inventory" not in st.session_state:
         try:
             with st.spinner("Carregando produtos e saldo atual..."):
@@ -834,31 +950,39 @@ def dashboard(client_id: str, client_secret: str) -> None:
 
     if run_analytics:
         try:
-            with st.spinner(
-                "Sincronizando categorias e consumo. Você pode aguardar nesta página..."
-            ):
-                (
-                    inventory,
-                    warnings,
-                    order_count,
-                    diagnostics,
-                    category_audit,
-                ) = load_inventory(client_id, client_secret, start_date, end_date)
+            with st.spinner("Consultando pedidos e calculando o consumo..."):
+                consumption, order_count, item_count, sales_warnings = (
+                    fetch_sales_consumption(
+                        start_date, end_date, client_id, client_secret
+                    )
+                )
+                inventory = apply_consumption(
+                    st.session_state.inventory,
+                    consumption,
+                    analysis_days,
+                )
                 st.session_state.inventory = inventory
-                st.session_state.inventory_warnings = warnings
+                existing_warnings = st.session_state.get("inventory_warnings", [])
+                st.session_state.inventory_warnings = (
+                    existing_warnings + sales_warnings
+                )
                 st.session_state.order_count = order_count
-                st.session_state.sync_diagnostics = diagnostics
-                st.session_state.category_audit = category_audit
                 st.session_state.inventory_period = analysis_days
-                st.session_state.categories_loaded = True
                 st.session_state.analytics_loaded = True
+                diagnostics = dict(st.session_state.get("sync_diagnostics", {}))
+                diagnostics["Pedidos considerados"] = order_count
+                diagnostics["Itens de pedidos considerados"] = item_count
+                diagnostics["Produtos com consumo"] = sum(
+                    value > 0 for value in consumption.values()
+                )
+                st.session_state.sync_diagnostics = diagnostics
                 st.session_state.updated_at = datetime.now(
                     timezone(timedelta(hours=-3))
                 )
             st.rerun()
         except requests.RequestException as exc:
             detail = exc.response.text if exc.response is not None else str(exc)
-            st.error(f"Falha na sincronização analítica: {detail}")
+            st.error(f"Falha ao sincronizar o consumo: {detail}")
 
     df = st.session_state.inventory.copy()
     warnings = st.session_state.get("inventory_warnings", [])
@@ -874,8 +998,7 @@ def dashboard(client_id: str, client_secret: str) -> None:
         )
     elif st.session_state.get("categories_loaded"):
         subtitle = (
-            f"Saldo e categorias atualizados em {timestamp} · Consumo e custos "
-            "ainda não sincronizados"
+            f"Saldo e categorias atualizados em {timestamp} · Consumo ainda não sincronizado"
         )
     else:
         subtitle = (
@@ -921,27 +1044,11 @@ def dashboard(client_id: str, client_secret: str) -> None:
         st.info("Nenhum produto foi retornado pela API.")
         return
 
-    df["Status de reposição"] = "Saudável"
-    df.loc[df["Consumo médio semanal"] <= 0, "Status de reposição"] = "Sem consumo"
-    df.loc[
-        (df["Consumo médio semanal"] > 0)
-        & (df["Cobertura (semanas)"] <= target_weeks * 1.5),
-        "Status de reposição",
-    ] = "Atenção"
-    df.loc[
-        (df["Consumo médio semanal"] > 0)
-        & (df["Cobertura (semanas)"] <= target_weeks),
-        "Status de reposição",
-    ] = "Repor"
-    df.loc[
-        (df["Consumo médio semanal"] > 0) & (df["Saldo atual"] <= 0),
-        "Status de reposição",
-    ] = "Reposição urgente"
-    df["Sugestão de compra"] = (
-        df["Consumo médio semanal"] * target_weeks - df["Saldo atual"]
-    ).clip(lower=0)
+    df = classify_replenishment(df)
 
     abc_base = df["Valor de consumo"].clip(lower=0)
+    if abc_base.sum() <= 0:
+        abc_base = df["Consumo no período"].clip(lower=0)
     total_consumption_value = abc_base.sum()
     if total_consumption_value > 0:
         cumulative = abc_base.sort_values(ascending=False).cumsum() / total_consumption_value
@@ -1005,8 +1112,8 @@ def dashboard(client_id: str, client_secret: str) -> None:
             "Situação", sorted(df["Situação"].unique()), default=["Ativo"]
         )
         replenishment_status = f3.multiselect(
-            "Reposição",
-            ["Reposição urgente", "Repor", "Atenção", "Saudável", "Sem consumo"],
+            "Criticidade",
+            ["Crítico", "Atenção", "Adequado"],
         )
         categories = f4.multiselect(
             "Categoria", sorted(df["Categoria"].astype(str).unique())
@@ -1024,7 +1131,7 @@ def dashboard(client_id: str, client_secret: str) -> None:
         filtered = filtered[filtered["Situação"].isin(situations)]
     if replenishment_status:
         filtered = filtered[
-            filtered["Status de reposição"].isin(replenishment_status)
+            filtered["Criticidade"].isin(replenishment_status)
         ]
     if categories:
         filtered = filtered[filtered["Categoria"].isin(categories)]
@@ -1036,34 +1143,69 @@ def dashboard(client_id: str, client_secret: str) -> None:
     k1.metric("SKUs ativos", br_number(active["ID"].nunique()))
     k2.metric("Saldo atual", br_number(active["Saldo atual"].sum(), 1))
     k3.metric(
-        "Reposição urgente",
-        br_number((active["Status de reposição"] == "Reposição urgente").sum()),
+        "Produtos críticos",
+        br_number((active["Criticidade"] == "Crítico").sum()),
     )
     k4.metric(
-        "Itens para repor",
-        br_number(active["Status de reposição"].isin(["Repor", "Reposição urgente"]).sum()),
+        "Produtos em atenção",
+        br_number((active["Criticidade"] == "Atenção").sum()),
     )
-    k5.metric("Valor do estoque", br_currency(active["Valor em estoque"].sum()))
+    k5.metric("Sugestão de compra", br_number(active["Sugestão de compra"].sum(), 1))
+
+    st.subheader("Fila de reposição")
+    critical_tab, attention_tab = st.tabs(["🔴 Críticos", "🟠 Atenção"])
+    alert_columns = [
+        "Código",
+        "Produto",
+        "Categoria",
+        "Saldo atual",
+        "Consumo médio semanal",
+        "Consumo médio mensal",
+        "Sugestão de compra",
+        "Motivo do alerta",
+    ]
+    with critical_tab:
+        critical_products = active[active["Criticidade"] == "Crítico"]
+        if critical_products.empty:
+            st.success("Nenhum produto em nível crítico.")
+        else:
+            st.dataframe(
+                critical_products[alert_columns].sort_values(
+                    ["Sugestão de compra", "Saldo atual"], ascending=[False, True]
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+    with attention_tab:
+        attention_products = active[active["Criticidade"] == "Atenção"]
+        if attention_products.empty:
+            st.success("Nenhum produto em nível de atenção.")
+        else:
+            st.dataframe(
+                attention_products[alert_columns].sort_values(
+                    ["Sugestão de compra", "Saldo atual"], ascending=[False, True]
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
 
     st.subheader("Visão geral")
     chart1, chart2, chart3 = st.columns([1, 1, 1.6])
     status_summary = (
-        active.groupby("Status de reposição", as_index=False)["ID"]
+        active.groupby("Criticidade", as_index=False)["ID"]
         .count()
         .rename(columns={"ID": "Produtos"})
     )
     fig_status = px.pie(
         status_summary,
-        names="Status de reposição",
+        names="Criticidade",
         values="Produtos",
         hole=0.62,
-        color="Status de reposição",
+        color="Criticidade",
         color_discrete_map={
-            "Saudável": "#22c55e",
+            "Adequado": "#22c55e",
             "Atenção": "#f59e0b",
-            "Repor": "#f97316",
-            "Reposição urgente": "#ef4444",
-            "Sem consumo": "#64748b",
+            "Crítico": "#ef4444",
         },
     )
     fig_status.update_layout(margin=dict(l=10, r=10, t=25, b=10), legend_title="")
@@ -1105,9 +1247,9 @@ def dashboard(client_id: str, client_secret: str) -> None:
     st.subheader("Produtos")
     display_columns = [
         "Código", "Produto", "Categoria", "Curva ABC", "Saldo atual",
-        "Custo cadastrado", "Consumo médio semanal", "Consumo médio mensal",
-        "Cobertura (semanas)", "Cobertura (meses)", "Status de reposição",
-        "Sugestão de compra", "Valor em estoque",
+        "Consumo médio semanal", "Consumo médio mensal", "Cobertura (semanas)",
+        "Cobertura (meses)", "Política de reposição", "Criticidade",
+        "Motivo do alerta", "Sugestão de compra",
     ]
     display_df = filtered[display_columns].copy()
     display_df["Cobertura (semanas)"] = display_df["Cobertura (semanas)"].replace(
@@ -1118,14 +1260,12 @@ def dashboard(client_id: str, client_secret: str) -> None:
     )
     st.dataframe(
         display_df.sort_values(
-            ["Status de reposição", "Cobertura (semanas)", "Produto"],
+            ["Criticidade", "Cobertura (semanas)", "Produto"],
             ascending=[True, True, True],
         ),
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Custo cadastrado": st.column_config.NumberColumn(format="R$ %.2f"),
-            "Valor em estoque": st.column_config.NumberColumn(format="R$ %.2f"),
             "Saldo atual": st.column_config.NumberColumn(format="%.2f"),
             "Consumo médio semanal": st.column_config.NumberColumn(format="%.2f"),
             "Consumo médio mensal": st.column_config.NumberColumn(format="%.2f"),
