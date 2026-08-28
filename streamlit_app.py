@@ -192,20 +192,12 @@ def fetch_stock_balances(
     return balances
 
 
-def fetch_product_metadata(
-    products: list[dict], client_id: str, client_secret: str
-) -> tuple[dict[int, str], dict[int, float], list[str], list[dict]]:
+def fetch_categories_by_product_filter(
+    client_id: str, client_secret: str
+) -> tuple[dict[int, str], list[dict], list[str]]:
+    """Replicate the category filter from Bling's product registration screen."""
     warnings: list[str] = []
-    try:
-        categories = fetch_all("categorias/produtos", client_id, client_secret)
-    except requests.RequestException as exc:
-        categories = []
-        warnings.append(f"Não foi possível listar as categorias: {exc}")
-    category_names = {
-        int(item["id"]): str(item.get("descricao") or "Sem categoria")
-        for item in categories
-        if item.get("id") is not None
-    }
+    categories = fetch_all("categorias/produtos", client_id, client_secret)
     category_by_id = {
         int(item["id"]): item for item in categories if item.get("id") is not None
     }
@@ -219,51 +211,64 @@ def fetch_product_metadata(
             return 0
         return 1 + category_depth(int(parent_id), visited | {category_id})
 
-    # Reproduce Bling's product-registration filter: query products by category.
     product_categories: dict[int, str] = {}
-    category_audit: list[dict] = []
-    categories_ordered = sorted(
+    audit: list[dict] = []
+    ordered = sorted(
         categories, key=lambda item: category_depth(int(item.get("id", 0)))
     )
-    category_progress = st.progress(0, text="Testando filtros de categorias no Bling...")
-    total_categories = max(len(categories_ordered), 1)
-    for index, category_item in enumerate(categories_ordered, start=1):
-        category_id = int(category_item["id"])
-        category_name = str(category_item.get("descricao") or f"Categoria {category_id}")
+    progress = st.progress(0, text="Consultando produtos por categoria...")
+    total = max(len(ordered), 1)
+    for index, category in enumerate(ordered, start=1):
+        category_id = int(category["id"])
+        category_name = str(
+            category.get("descricao") or f"Categoria {category_id}"
+        )
         try:
-            category_products = fetch_all(
+            matched = fetch_all(
                 "produtos",
                 client_id,
                 client_secret,
                 {"criterio": 5, "idCategoria": category_id},
             )
-            matched_ids = [
-                int(item["id"]) for item in category_products if item.get("id")
-            ]
+            matched_ids = [int(item["id"]) for item in matched if item.get("id")]
             for product_id in matched_ids:
-                # Children are processed after parents, so the most specific wins.
+                # Parent categories are processed first; the most specific wins.
                 product_categories[product_id] = category_name
-            category_audit.append(
-                {
-                    "ID da categoria": category_id,
-                    "Categoria": category_name,
-                    "Produtos retornados pelo filtro": len(matched_ids),
-                    "Status": "OK",
-                }
-            )
+            status = "OK"
         except requests.RequestException as exc:
-            category_audit.append(
-                {
-                    "ID da categoria": category_id,
-                    "Categoria": category_name,
-                    "Produtos retornados pelo filtro": 0,
-                    "Status": f"Erro: {exc}",
-                }
-            )
-        category_progress.progress(
-            index / total_categories, text="Testando filtros de categorias no Bling..."
+            matched_ids = []
+            status = f"Erro: {exc}"
+        audit.append(
+            {
+                "ID da categoria": category_id,
+                "Categoria": category_name,
+                "Produtos retornados pelo filtro": len(matched_ids),
+                "Status": status,
+            }
         )
-    category_progress.empty()
+        progress.progress(index / total, text="Consultando produtos por categoria...")
+    progress.empty()
+    if not categories:
+        warnings.append("A API do Bling não retornou categorias cadastradas.")
+    elif not product_categories:
+        warnings.append(
+            "As categorias foram listadas, mas todos os filtros retornaram zero produtos."
+        )
+    return product_categories, audit, warnings
+
+
+def fetch_product_metadata(
+    products: list[dict], client_id: str, client_secret: str
+) -> tuple[dict[int, str], dict[int, float], list[str], list[dict]]:
+    (
+        product_categories,
+        category_audit,
+        warnings,
+    ) = fetch_categories_by_product_filter(client_id, client_secret)
+    category_names = {
+        int(item["ID da categoria"]): str(item["Categoria"])
+        for item in category_audit
+    }
 
     product_details: dict[int, dict] = {}
     product_rows = {int(item["id"]): item for item in products if item.get("id")}
@@ -731,9 +736,15 @@ def dashboard(client_id: str, client_secret: str) -> None:
         if st.button("Atualizar saldo", type="primary", use_container_width=True):
             st.session_state.pop("inventory", None)
             st.session_state.pop("category_audit", None)
+            st.session_state.categories_loaded = False
             st.session_state.analytics_loaded = False
+        run_categories = st.button(
+            "Sincronizar somente categorias",
+            use_container_width=True,
+            help="Consulta as categorias e seus produtos sem carregar pedidos ou custos.",
+        )
         run_analytics = st.button(
-            "Sincronizar consumo e categorias",
+            "Sincronizar consumo e custos",
             use_container_width=True,
             help=(
                 "Processo mais demorado: consulta detalhes dos produtos e dos "
@@ -741,9 +752,11 @@ def dashboard(client_id: str, client_secret: str) -> None:
             ),
         )
         if st.session_state.get("analytics_loaded"):
-            st.success("Análise sincronizada")
+            st.success("Consumo e custos sincronizados")
+        elif st.session_state.get("categories_loaded"):
+            st.success("Categorias sincronizadas")
         else:
-            st.caption("Saldo rápido ativo · análise ainda não sincronizada")
+            st.caption("Saldo rápido ativo · categorias ainda não sincronizadas")
         st.divider()
         if st.button("Desconectar", use_container_width=True):
             for key in [
@@ -751,6 +764,8 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 "inventory",
                 "inventory_warnings",
                 "category_audit",
+                "categories_loaded",
+                "analytics_loaded",
             ]:
                 st.session_state.pop(key, None)
             st.rerun()
@@ -777,6 +792,7 @@ def dashboard(client_id: str, client_secret: str) -> None:
                     "Produtos com consumo": 0,
                 }
                 st.session_state.category_audit = []
+                st.session_state.categories_loaded = False
                 st.session_state.inventory_period = analysis_days
                 st.session_state.analytics_loaded = False
                 st.session_state.updated_at = datetime.now(
@@ -786,6 +802,35 @@ def dashboard(client_id: str, client_secret: str) -> None:
             detail = exc.response.text if exc.response is not None else str(exc)
             st.error(f"Falha ao consultar a API do Bling: {detail}")
             return
+
+    if run_categories:
+        try:
+            with st.spinner("Sincronizando somente categorias..."):
+                category_map, category_audit, category_warnings = (
+                    fetch_categories_by_product_filter(client_id, client_secret)
+                )
+                inventory = st.session_state.inventory.copy()
+                mapped = inventory["ID"].map(category_map)
+                inventory["Categoria"] = mapped.fillna("Sem categoria")
+                st.session_state.inventory = inventory
+                st.session_state.category_audit = category_audit
+                st.session_state.inventory_warnings = category_warnings
+                st.session_state.categories_loaded = True
+                st.session_state.updated_at = datetime.now(
+                    timezone(timedelta(hours=-3))
+                )
+                diagnostics = dict(st.session_state.get("sync_diagnostics", {}))
+                diagnostics["Categorias cadastradas"] = len(category_audit)
+                diagnostics["Produtos vinculados por filtro"] = len(category_map)
+                diagnostics["Categorias com produtos"] = sum(
+                    int(item["Produtos retornados pelo filtro"] > 0)
+                    for item in category_audit
+                )
+                st.session_state.sync_diagnostics = diagnostics
+            st.rerun()
+        except requests.RequestException as exc:
+            detail = exc.response.text if exc.response is not None else str(exc)
+            st.error(f"Falha ao sincronizar categorias: {detail}")
 
     if run_analytics:
         try:
@@ -805,6 +850,7 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 st.session_state.sync_diagnostics = diagnostics
                 st.session_state.category_audit = category_audit
                 st.session_state.inventory_period = analysis_days
+                st.session_state.categories_loaded = True
                 st.session_state.analytics_loaded = True
                 st.session_state.updated_at = datetime.now(
                     timezone(timedelta(hours=-3))
@@ -826,10 +872,15 @@ def dashboard(client_id: str, client_secret: str) -> None:
             f"Posição em {timestamp} · Consumo de {start_date:%d/%m/%Y} "
             f"a {end_date:%d/%m/%Y} · {order_count} pedidos"
         )
+    elif st.session_state.get("categories_loaded"):
+        subtitle = (
+            f"Saldo e categorias atualizados em {timestamp} · Consumo e custos "
+            "ainda não sincronizados"
+        )
     else:
         subtitle = (
-            f"Saldo atualizado em {timestamp} · Clique em “Sincronizar consumo "
-            "e categorias” quando precisar atualizar as análises"
+            f"Saldo atualizado em {timestamp} · Clique em “Sincronizar somente "
+            "categorias” para carregar as classificações dos produtos"
         )
     st.markdown(
         f'<p class="ul-subtitle">{subtitle}</p>',

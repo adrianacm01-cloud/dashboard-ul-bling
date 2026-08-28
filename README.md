@@ -5,9 +5,12 @@ produtos, categorias, saldos e pedidos de venda. Apresenta consumo médio,
 cobertura de estoque, curva ABC, alertas de reposição, filtros e exportação CSV.
 
 O primeiro carregamento usa somente a listagem paginada de produtos para abrir
-rapidamente com saldo virtual e custo. Categorias e consumo são atualizados sob
-demanda pelo botão **Sincronizar consumo e categorias**, pois o Bling exige uma
-consulta individual para cada produto e pedido.
+rapidamente com saldo virtual. A sincronização foi separada em etapas:
+
+- **Sincronizar somente categorias**: reproduz os filtros do cadastro de
+  produtos e salva o resultado imediatamente, sem consultar pedidos ou custos.
+- **Sincronizar consumo e custos**: etapa analítica mais demorada, pois o Bling
+  exige uma consulta individual para cada produto e pedido.
 
 ## Publicação
 
