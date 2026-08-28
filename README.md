@@ -55,3 +55,21 @@ autorização após o encerramento da sessão.
 - Teste de categorias: para cada categoria cadastrada, o dashboard executa a
   mesma lógica de filtro da tela de produtos (`GET /produtos?idCategoria=...`),
   relaciona os IDs retornados ao estoque e disponibiliza uma auditoria em CSV.
+
+## Criticidade de reposição
+
+Para cafés, energéticos, refrigerantes, sodas, sucos, água, balas e confeitos,
+chocolates, salgadinhos, doces e salgados:
+
+- crítico: saldo atual menor ou igual ao consumo médio semanal;
+- atenção: saldo abaixo do consumo médio mensal;
+- adequado: saldo igual ou acima do consumo médio mensal.
+
+Para as demais categorias (e como fallback quando ainda não existe consumo):
+
+- crítico: saldo menor que 5 unidades;
+- atenção: saldo entre 5 e 10 unidades;
+- adequado: saldo acima de 10 unidades.
+
+Categorias e consumo são sincronizados em etapas independentes para que uma
+consulta longa de pedidos não apague categorias já carregadas.
