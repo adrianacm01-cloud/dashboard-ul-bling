@@ -9,8 +9,8 @@ rapidamente com saldo virtual. A sincronização foi separada em etapas:
 
 - **Sincronizar somente categorias**: reproduz os filtros do cadastro de
   produtos e salva o resultado imediatamente, sem consultar pedidos ou custos.
-- **Sincronizar consumo e custos**: etapa analítica mais demorada, pois o Bling
-  exige uma consulta individual para cada produto e pedido.
+- **Sincronizar consumo**: consulta os pedidos de venda e, quando eles não
+  contêm itens, tenta as NFC-e emitidas no mesmo período.
 
 ## Publicação
 
@@ -41,14 +41,15 @@ autorização após o encerramento da sessão.
 - Saldo atual: saldo virtual do Bling, já descontadas as reservas.
 - Custo cadastrado: `precoCusto` do fornecedor padrão; a API não fornece um
   campo separado de custo médio.
-- Consumo: quantidade dos itens de pedidos não cancelados dentro do período.
+- Consumo: quantidade dos itens de pedidos não cancelados; se nenhum item for
+  encontrado, usa NFC-e autorizadas, emitidas ou registradas no período.
 - Cobertura: saldo atual dividido pelo consumo médio semanal ou mensal.
 - Curva ABC: participação acumulada no valor de consumo (`quantidade × custo`),
   com faixas A até 80%, B até 95% e C para o restante.
 - Reposição: compara a cobertura atual com as semanas desejadas no painel.
-- Inativo no dashboard: marca local de visualização que remove o produto dos
-  indicadores, gráficos e alertas sem alterar o cadastro no Bling. Enquanto não
-  houver banco de dados, a marca permanece somente durante a sessão.
+- Inativo no dashboard: seleção múltipla persistida no servidor do dashboard,
+  que remove produtos dos indicadores, gráficos e alertas sem alterar o Bling.
+  O botão "Remover filtro de inativos" restaura todos os produtos.
 - Categoria: correlacionada pelo ID interno entre a listagem de estoque e o
   cadastro individual do produto. Variações sem categoria própria herdam a
   categoria do produto-pai. O SKU e o nome não são usados como chave do vínculo.
@@ -73,3 +74,5 @@ Para as demais categorias (e como fallback quando ainda não existe consumo):
 
 Categorias e consumo são sincronizados em etapas independentes para que uma
 consulta longa de pedidos não apague categorias já carregadas.
+As categorias sincronizadas são salvas no servidor e reaplicadas automaticamente
+quando o painel é aberto novamente.

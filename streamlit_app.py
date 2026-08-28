@@ -1,10 +1,13 @@
 import base64
 import hashlib
 import hmac
+import json
+import os
 import secrets
 import time
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import urlencode
 
 import pandas as pd
@@ -17,6 +20,7 @@ AUTHORIZE_URL = "https://www.bling.com.br/Api/v3/oauth/authorize"
 TOKEN_URL = "https://api.bling.com.br/Api/v3/oauth/token"
 API_URL = "https://api.bling.com.br/Api/v3"
 REQUEST_INTERVAL = 0.36
+STATE_FILE = Path(__file__).with_name("dashboard_state.json")
 
 st.set_page_config(
     page_title="Ultra Loot | Estoque",
@@ -52,6 +56,26 @@ def setting(name: str) -> str:
         st.error(f"Configure o segredo `{name}` no Streamlit Cloud.")
         st.stop()
     return str(value)
+
+
+def load_dashboard_state() -> dict:
+    """Load dashboard-only choices; never sends them to Bling."""
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def save_dashboard_state(**changes) -> None:
+    """Atomically persist categories and hidden products on the app server."""
+    state = load_dashboard_state()
+    state.update(changes)
+    temporary = STATE_FILE.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(temporary, STATE_FILE)
 
 
 def create_state(client_secret: str) -> str:
@@ -381,12 +405,93 @@ def fetch_product_metadata(
     return product_categories, product_costs, warnings, category_audit
 
 
+def add_document_items(
+    detail: dict,
+    consumption: dict[int, float],
+    product_id_by_code: dict[str, int],
+) -> int:
+    item_count = 0
+    for item in detail.get("itens", []) or []:
+        product_id = nested_value(item, "produto.id", "idProduto")
+        if product_id is None:
+            code = str(
+                nested_value(item, "codigo", "produto.codigo", default="") or ""
+            ).strip().casefold()
+            product_id = product_id_by_code.get(code)
+        if product_id is None:
+            continue
+        product_id = int(product_id)
+        quantity = number(item.get("quantidade"))
+        if quantity > 0:
+            consumption[product_id] = consumption.get(product_id, 0.0) + quantity
+            item_count += 1
+    return item_count
+
+
+def fetch_invoice_consumption(
+    resource: str,
+    start_date: date,
+    end_date: date,
+    client_id: str,
+    client_secret: str,
+    product_id_by_code: dict[str, int],
+) -> tuple[dict[int, float], int, int, list[str]]:
+    warnings: list[str] = []
+    try:
+        documents = fetch_all(
+            resource,
+            client_id,
+            client_secret,
+            {
+                "dataEmissaoInicial": f"{start_date.isoformat()} 00:00:00",
+                "dataEmissaoFinal": f"{end_date.isoformat()} 23:59:59",
+            },
+        )
+    except requests.RequestException as exc:
+        status = exc.response.status_code if exc.response is not None else "conexão"
+        warnings.append(
+            f"A fonte {resource.upper()} não pôde ser consultada ({status}). "
+            "Confirme o escopo de leitura desse documento no aplicativo Bling."
+        )
+        return {}, 0, 0, warnings
+
+    # A API define 5=Autorizada, 6=Emitida DANFE e 7=Registrada.
+    valid_statuses = {5, 6, 7}
+    valid_documents = [
+        item for item in documents
+        if int(number(nested_value(item, "situacao.id", "situacao")))
+        in valid_statuses
+    ]
+    consumption: dict[int, float] = {}
+    item_count = 0
+    failed = 0
+    label = "NFC-e" if resource == "nfce" else "NF-e"
+    progress = st.progress(0, text=f"Calculando consumo pelas {label}...")
+    total = max(len(valid_documents), 1)
+    for index, document in enumerate(valid_documents, start=1):
+        try:
+            detail = api_get(
+                f"{resource}/{int(document['id'])}", {}, client_id, client_secret
+            ).get("data", {})
+            item_count += add_document_items(
+                detail, consumption, product_id_by_code
+            )
+        except (requests.RequestException, KeyError, TypeError, ValueError):
+            failed += 1
+        progress.progress(index / total, text=f"Calculando consumo pelas {label}...")
+    progress.empty()
+    if failed:
+        warnings.append(f"{failed} documento(s) de {label} não puderam ser detalhados.")
+    return consumption, len(valid_documents), item_count, warnings
+
+
 def fetch_sales_consumption(
     start_date: date,
     end_date: date,
     client_id: str,
     client_secret: str,
-) -> tuple[dict[int, float], int, int, list[str]]:
+    product_id_by_code: dict[str, int],
+) -> tuple[dict[int, float], int, int, str, list[str]]:
     orders = fetch_all(
         "pedidos/vendas",
         client_id,
@@ -427,14 +532,7 @@ def fetch_sales_consumption(
             failed_orders += 1
             progress.progress(index / total, text="Calculando consumo pelos pedidos de venda...")
             continue
-        for item in detail.get("itens", []):
-            product_id = nested_value(item, "produto.id")
-            if product_id is not None:
-                product_id = int(product_id)
-                consumption[product_id] = consumption.get(product_id, 0.0) + number(
-                    item.get("quantidade")
-                )
-                item_count += 1
+        item_count += add_document_items(detail, consumption, product_id_by_code)
         progress.progress(index / total, text="Calculando consumo pelos pedidos de venda...")
     progress.empty()
     if orders and not any(situation_names.values()):
@@ -447,7 +545,27 @@ def fetch_sales_consumption(
             f"{failed_orders} pedido(s) não puderam ser detalhados e foram "
             "ignorados no cálculo de consumo."
         )
-    return consumption, len(valid_orders), item_count, warnings
+    if item_count > 0:
+        return consumption, len(valid_orders), item_count, "Pedidos de venda", warnings
+
+    warnings.append(
+        "Os pedidos de venda não trouxeram itens vinculados aos produtos; "
+        "o painel tentou usar as NFC-e do mesmo período."
+    )
+    invoice_consumption, document_count, invoice_items, invoice_warnings = (
+        fetch_invoice_consumption(
+            "nfce", start_date, end_date, client_id, client_secret,
+            product_id_by_code,
+        )
+    )
+    warnings.extend(invoice_warnings)
+    return (
+        invoice_consumption,
+        document_count,
+        invoice_items,
+        "NFC-e" if invoice_items else "Nenhuma fonte com itens",
+        warnings,
+    )
 
 
 def nested_value(item: dict, *paths, default=None):
@@ -728,12 +846,16 @@ def load_inventory(
     warnings.extend(metadata_warnings)
 
     try:
-        consumption, order_count, item_count, sales_warnings = fetch_sales_consumption(
-            start_date, end_date, client_id, client_secret
+        product_id_by_code = {
+            str(item.get("codigo") or "").strip().casefold(): int(item["id"])
+            for item in products if item.get("id") and item.get("codigo")
+        }
+        consumption, order_count, item_count, source, sales_warnings = fetch_sales_consumption(
+            start_date, end_date, client_id, client_secret, product_id_by_code
         )
         warnings.extend(sales_warnings)
     except requests.HTTPError as exc:
-        consumption, order_count, item_count = {}, 0, 0
+        consumption, order_count, item_count, source = {}, 0, 0, "Indisponível"
         if exc.response is not None and exc.response.status_code == 403:
             warnings.append(
                 "O aplicativo não possui leitura de pedidos de venda. Adicione "
@@ -768,6 +890,7 @@ def load_inventory(
             "Custos maiores que zero": sum(value > 0 for value in product_costs.values()),
             "Pedidos considerados": order_count,
             "Itens de pedidos considerados": item_count,
+            "Fonte do consumo": source,
             "Produtos com consumo": sum(value > 0 for value in consumption.values()),
         },
         category_audit,
@@ -830,6 +953,7 @@ def login_page(client_id: str, client_secret: str) -> None:
 
 
 def dashboard(client_id: str, client_secret: str) -> None:
+    persisted_state = load_dashboard_state()
     with st.sidebar:
         st.title("Ultra Loot")
         st.caption("Estoque, consumo e reposição")
@@ -843,7 +967,9 @@ def dashboard(client_id: str, client_secret: str) -> None:
         if st.button("Atualizar saldo", type="primary", use_container_width=True):
             st.session_state.pop("inventory", None)
             st.session_state.pop("category_audit", None)
-            st.session_state.categories_loaded = False
+            st.session_state.categories_loaded = bool(
+                persisted_state.get("product_categories")
+            )
             st.session_state.analytics_loaded = False
         run_categories = st.button(
             "Sincronizar somente categorias",
@@ -894,12 +1020,23 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 inventory = load_basic_inventory(
                     client_id, client_secret, analysis_days
                 )
+                saved_categories = {
+                    int(product_id): str(category)
+                    for product_id, category in persisted_state.get(
+                        "product_categories", {}
+                    ).items()
+                }
+                if saved_categories:
+                    mapped = inventory["ID"].map(saved_categories)
+                    inventory["Categoria"] = mapped.fillna(inventory["Categoria"])
                 st.session_state.inventory = inventory
                 st.session_state.inventory_warnings = []
                 st.session_state.order_count = 0
                 st.session_state.sync_diagnostics = {
                     "Produtos": len(inventory),
-                    "Categorias identificadas": 0,
+                    "Categorias identificadas": int(
+                        (inventory["Categoria"] != "Sem categoria").sum()
+                    ),
                     "Custos maiores que zero": int(
                         (inventory["Custo cadastrado"] > 0).sum()
                     ),
@@ -907,8 +1044,10 @@ def dashboard(client_id: str, client_secret: str) -> None:
                     "Itens de pedidos considerados": 0,
                     "Produtos com consumo": 0,
                 }
-                st.session_state.category_audit = []
-                st.session_state.categories_loaded = False
+                st.session_state.category_audit = persisted_state.get(
+                    "category_audit", []
+                )
+                st.session_state.categories_loaded = bool(saved_categories)
                 st.session_state.inventory_period = analysis_days
                 st.session_state.analytics_loaded = False
                 st.session_state.updated_at = datetime.now(
@@ -932,6 +1071,14 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 st.session_state.category_audit = category_audit
                 st.session_state.inventory_warnings = category_warnings
                 st.session_state.categories_loaded = True
+                save_dashboard_state(
+                    product_categories={
+                        str(product_id): category
+                        for product_id, category in category_map.items()
+                    },
+                    category_audit=category_audit,
+                    categories_updated_at=datetime.now(timezone.utc).isoformat(),
+                )
                 st.session_state.updated_at = datetime.now(
                     timezone(timedelta(hours=-3))
                 )
@@ -951,9 +1098,15 @@ def dashboard(client_id: str, client_secret: str) -> None:
     if run_analytics:
         try:
             with st.spinner("Consultando pedidos e calculando o consumo..."):
-                consumption, order_count, item_count, sales_warnings = (
+                product_id_by_code = {
+                    str(row["Código"]).strip().casefold(): int(row["ID"])
+                    for _, row in st.session_state.inventory.iterrows()
+                    if str(row["Código"]).strip()
+                }
+                consumption, order_count, item_count, source, sales_warnings = (
                     fetch_sales_consumption(
-                        start_date, end_date, client_id, client_secret
+                        start_date, end_date, client_id, client_secret,
+                        product_id_by_code,
                     )
                 )
                 inventory = apply_consumption(
@@ -972,6 +1125,7 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 diagnostics = dict(st.session_state.get("sync_diagnostics", {}))
                 diagnostics["Pedidos considerados"] = order_count
                 diagnostics["Itens de pedidos considerados"] = item_count
+                diagnostics["Fonte do consumo"] = source
                 diagnostics["Produtos com consumo"] = sum(
                     value > 0 for value in consumption.values()
                 )
@@ -1060,7 +1214,12 @@ def dashboard(client_id: str, client_secret: str) -> None:
     else:
         df["Curva ABC"] = "Sem classificação"
 
-    inactive_ids = set(st.session_state.get("dashboard_inactive_products", []))
+    if "dashboard_inactive_products" not in st.session_state:
+        st.session_state.dashboard_inactive_products = [
+            int(product_id)
+            for product_id in persisted_state.get("inactive_product_ids", [])
+        ]
+    inactive_ids = set(st.session_state.dashboard_inactive_products)
     with st.expander(
         f"Gerenciar produtos ocultos ({len(inactive_ids)})",
         expanded=False,
@@ -1069,34 +1228,34 @@ def dashboard(client_id: str, client_secret: str) -> None:
             "Marque produtos que não devem participar dos indicadores, gráficos "
             "e alertas. Esta ação não altera o cadastro no Bling."
         )
-        tag_table = df[["ID", "Código", "Produto", "Categoria"]].copy()
-        tag_table.insert(
-            0,
-            "Inativo no dashboard",
-            tag_table["ID"].isin(inactive_ids),
+        product_labels = {
+            int(row["ID"]): (
+                f"{row['Código']} — {row['Produto']}" if row["Código"]
+                else str(row["Produto"])
+            )
+            for _, row in df.sort_values("Produto").iterrows()
+        }
+        selected_inactive = st.multiselect(
+            "Selecione um ou mais produtos",
+            options=list(product_labels),
+            default=[product_id for product_id in inactive_ids if product_id in product_labels],
+            format_func=lambda product_id: product_labels[product_id],
+            help="A seleção é usada somente pelo dashboard e não altera o Bling.",
         )
-        edited_tags = st.data_editor(
-            tag_table,
-            use_container_width=True,
-            hide_index=True,
-            disabled=["ID", "Código", "Produto", "Categoria"],
-            column_config={
-                "Inativo no dashboard": st.column_config.CheckboxColumn(
-                    "Inativo no dashboard",
-                    help="Oculta apenas neste dashboard; não altera o Bling.",
-                ),
-                "ID": None,
-            },
-            key="product_visibility_editor",
-        )
-        new_inactive_ids = set(
-            edited_tags.loc[
-                edited_tags["Inativo no dashboard"], "ID"
-            ].astype(int)
-        )
-        if new_inactive_ids != inactive_ids:
-            st.session_state.dashboard_inactive_products = sorted(new_inactive_ids)
-            inactive_ids = new_inactive_ids
+        save_col, clear_col = st.columns(2)
+        if save_col.button(
+            "Salvar produtos inativos", type="primary", use_container_width=True
+        ):
+            saved_ids = sorted(set(map(int, selected_inactive)))
+            st.session_state.dashboard_inactive_products = saved_ids
+            save_dashboard_state(inactive_product_ids=saved_ids)
+            st.success(f"{len(saved_ids)} produto(s) ocultado(s) e salvo(s).")
+            st.rerun()
+        if clear_col.button(
+            "Remover filtro de inativos", use_container_width=True
+        ):
+            st.session_state.dashboard_inactive_products = []
+            save_dashboard_state(inactive_product_ids=[])
             st.rerun()
 
     if inactive_ids:
