@@ -4,12 +4,12 @@ Dashboard Streamlit integrado à API v3 do Bling por OAuth 2.0. Consulta
 produtos, categorias, saldos e pedidos de venda. Apresenta consumo médio,
 cobertura de estoque, curva ABC, alertas de reposição, filtros e exportação CSV.
 
-O primeiro carregamento usa somente a listagem paginada de produtos para abrir
-rapidamente com saldo virtual. A sincronização foi separada em etapas:
+Ao conectar, o dashboard atualiza automaticamente saldo, categorias e consumo,
+nessa ordem. Os botões laterais permanecem disponíveis para atualizações manuais:
 
-- **Sincronizar somente categorias**: reproduz os filtros do cadastro de
+- **Atualizar categorias**: reproduz os filtros do cadastro de
   produtos e salva o resultado imediatamente, sem consultar pedidos ou custos.
-- **Sincronizar consumo**: consulta os pedidos de venda e, quando eles não
+- **Atualizar consumo**: consulta os pedidos de venda e, quando eles não
   contêm itens, tenta as NFC-e emitidas no mesmo período.
 
 ## Publicação

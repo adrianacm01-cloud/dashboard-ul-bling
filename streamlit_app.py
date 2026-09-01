@@ -44,6 +44,19 @@ st.markdown(
             border: 0; font-weight: 700;
         }
         .ul-subtitle { color: #6b7280; margin-top: -12px; margin-bottom: 18px; }
+        .ul-card {
+            background: rgba(255,255,255,.04); border: 1px solid rgba(148,163,184,.20);
+            border-left: 6px solid var(--card-color); border-radius: 18px;
+            padding: 18px 20px; min-height: 118px; box-shadow: 0 8px 24px rgba(0,0,0,.08);
+        }
+        .ul-card-label { color: #94a3b8; font-size: .78rem; font-weight: 800;
+            letter-spacing: .05em; text-transform: uppercase; }
+        .ul-card-value { color: var(--card-color); font-size: 2rem; line-height: 1.25;
+            font-weight: 850; margin-top: 10px; }
+        .ul-section { margin-top: 1rem; padding-top: .4rem; }
+        [data-testid="stDataFrame"] { border: 1px solid rgba(148,163,184,.18); border-radius: 14px; }
+        .stTabs [data-baseweb="tab-list"] { gap: .5rem; }
+        .stTabs [data-baseweb="tab"] { border-radius: 999px; padding: .35rem 1rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -921,6 +934,15 @@ def br_currency(value: float) -> str:
     return f"R$ {br_number(value, 2)}"
 
 
+def metric_card(container, label: str, value: str, color: str) -> None:
+    container.markdown(
+        f"""<div class="ul-card" style="--card-color:{color}">
+        <div class="ul-card-label">{label}</div>
+        <div class="ul-card-value">{value}</div></div>""",
+        unsafe_allow_html=True,
+    )
+
+
 def handle_oauth(client_id: str, client_secret: str) -> None:
     error = st.query_params.get("error")
     code = st.query_params.get("code")
@@ -954,6 +976,7 @@ def login_page(client_id: str, client_secret: str) -> None:
 
 def dashboard(client_id: str, client_secret: str) -> None:
     persisted_state = load_dashboard_state()
+    auto_sync_required = False
     with st.sidebar:
         st.title("Ultra Loot")
         st.caption("Estoque, consumo e reposição")
@@ -972,12 +995,12 @@ def dashboard(client_id: str, client_secret: str) -> None:
             )
             st.session_state.analytics_loaded = False
         run_categories = st.button(
-            "Sincronizar somente categorias",
+            "Atualizar categorias",
             use_container_width=True,
             help="Consulta as categorias e seus produtos sem carregar pedidos ou custos.",
         )
         run_analytics = st.button(
-            "Sincronizar consumo",
+            "Atualizar consumo",
             use_container_width=True,
             help=(
                 "Consulta os pedidos do período para calcular médias e criticidade."
@@ -1053,12 +1076,13 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 st.session_state.updated_at = datetime.now(
                     timezone(timedelta(hours=-3))
                 )
+                auto_sync_required = True
         except requests.RequestException as exc:
             detail = exc.response.text if exc.response is not None else str(exc)
             st.error(f"Falha ao consultar a API do Bling: {detail}")
             return
 
-    if run_categories:
+    if run_categories or auto_sync_required:
         try:
             with st.spinner("Sincronizando somente categorias..."):
                 category_map, category_audit, category_warnings = (
@@ -1090,12 +1114,13 @@ def dashboard(client_id: str, client_secret: str) -> None:
                     for item in category_audit
                 )
                 st.session_state.sync_diagnostics = diagnostics
-            st.rerun()
+            if run_categories and not auto_sync_required:
+                st.rerun()
         except requests.RequestException as exc:
             detail = exc.response.text if exc.response is not None else str(exc)
             st.error(f"Falha ao sincronizar categorias: {detail}")
 
-    if run_analytics:
+    if run_analytics or auto_sync_required:
         try:
             with st.spinner("Consultando pedidos e calculando o consumo..."):
                 product_id_by_code = {
@@ -1220,52 +1245,11 @@ def dashboard(client_id: str, client_secret: str) -> None:
             for product_id in persisted_state.get("inactive_product_ids", [])
         ]
     inactive_ids = set(st.session_state.dashboard_inactive_products)
-    with st.expander(
-        f"Gerenciar produtos ocultos ({len(inactive_ids)})",
-        expanded=False,
-    ):
-        st.caption(
-            "Marque produtos que não devem participar dos indicadores, gráficos "
-            "e alertas. Esta ação não altera o cadastro no Bling."
-        )
-        product_labels = {
-            int(row["ID"]): (
-                f"{row['Código']} — {row['Produto']}" if row["Código"]
-                else str(row["Produto"])
-            )
-            for _, row in df.sort_values("Produto").iterrows()
-        }
-        selected_inactive = st.multiselect(
-            "Selecione um ou mais produtos",
-            options=list(product_labels),
-            default=[product_id for product_id in inactive_ids if product_id in product_labels],
-            format_func=lambda product_id: product_labels[product_id],
-            help="A seleção é usada somente pelo dashboard e não altera o Bling.",
-        )
-        save_col, clear_col = st.columns(2)
-        if save_col.button(
-            "Salvar produtos inativos", type="primary", use_container_width=True
-        ):
-            saved_ids = sorted(set(map(int, selected_inactive)))
-            st.session_state.dashboard_inactive_products = saved_ids
-            save_dashboard_state(inactive_product_ids=saved_ids)
-            st.success(f"{len(saved_ids)} produto(s) ocultado(s) e salvo(s).")
-            st.rerun()
-        if clear_col.button(
-            "Remover filtro de inativos", use_container_width=True
-        ):
-            st.session_state.dashboard_inactive_products = []
-            save_dashboard_state(inactive_product_ids=[])
-            st.rerun()
-
     if inactive_ids:
         df = df[~df["ID"].isin(inactive_ids)].copy()
-    st.caption(
-        f"{len(inactive_ids)} produto(s) marcado(s) como inativo(s) somente no dashboard."
-    )
 
     with st.expander("Filtros", expanded=True):
-        f1, f2, f3, f4, f5 = st.columns([2.2, 1.1, 1.4, 1.3, 1.0])
+        f1, f2, f3, f4 = st.columns([2.3, 1.1, 1.4, 1.5])
         search = f1.text_input("Buscar produto ou código", placeholder="Digite para pesquisar")
         situations = f2.multiselect(
             "Situação", sorted(df["Situação"].unique()), default=["Ativo"]
@@ -1277,7 +1261,6 @@ def dashboard(client_id: str, client_secret: str) -> None:
         categories = f4.multiselect(
             "Categoria", sorted(df["Categoria"].astype(str).unique())
         )
-        abc_filter = f5.multiselect("Curva ABC", ["A", "B", "C"])
 
     filtered = df.copy()
     if search:
@@ -1294,8 +1277,200 @@ def dashboard(client_id: str, client_secret: str) -> None:
         ]
     if categories:
         filtered = filtered[filtered["Categoria"].isin(categories)]
-    if abc_filter:
-        filtered = filtered[filtered["Curva ABC"].isin(abc_filter)]
+
+    filtered["Sinal"] = filtered["Criticidade"].map(
+        {"Crítico": "🔴 Crítico", "Atenção": "🟠 Atenção", "Adequado": "🟢 Adequado"}
+    ).fillna(filtered["Criticidade"])
+    active = filtered[filtered["Situação"] == "Ativo"].copy()
+
+    overview_tab, abc_tab = st.tabs(
+        ["📦 Reposição e produtos", "📊 Curva ABC"]
+    )
+
+    with overview_tab:
+        cards = st.columns(5)
+        metric_card(cards[0], "SKUs ativos", br_number(active["ID"].nunique()), "#6366f1")
+        metric_card(cards[1], "Saldo atual", br_number(active["Saldo atual"].sum(), 1), "#3b82f6")
+        metric_card(
+            cards[2], "Reposição crítica",
+            br_number((active["Criticidade"] == "Crítico").sum()), "#ef4444",
+        )
+        metric_card(
+            cards[3], "Reposição em atenção",
+            br_number((active["Criticidade"] == "Atenção").sum()), "#f59e0b",
+        )
+        metric_card(
+            cards[4], "Sugestão de compra",
+            br_number(active["Sugestão de compra"].sum(), 1), "#22c55e",
+        )
+
+        st.markdown('<div class="ul-section"></div>', unsafe_allow_html=True)
+        st.subheader("🚨 Fila de reposição")
+        st.caption("Prioridade da esquerda para a direita: crítico, atenção e adequado.")
+        critical_tab, attention_tab, adequate_tab = st.tabs(
+            ["🔴 Críticos", "🟠 Atenção", "🟢 Adequados"]
+        )
+        alert_columns = [
+            "Sinal", "Código", "Produto", "Categoria", "Saldo atual",
+            "Consumo médio semanal", "Consumo médio mensal",
+            "Sugestão de compra", "Motivo do alerta",
+        ]
+        alert_formats = {
+            "Saldo atual": "{:.1f}",
+            "Consumo médio semanal": "{:.1f}",
+            "Consumo médio mensal": "{:.1f}",
+            "Sugestão de compra": "{:.1f}",
+        }
+        for container, level, color, empty_message in [
+            (critical_tab, "Crítico", "rgba(239,68,68,.13)", "Nenhum produto em nível crítico."),
+            (attention_tab, "Atenção", "rgba(245,158,11,.13)", "Nenhum produto em atenção."),
+            (adequate_tab, "Adequado", "rgba(34,197,94,.10)", "Nenhum produto adequado para os filtros atuais."),
+        ]:
+            with container:
+                products_at_level = active[active["Criticidade"] == level]
+                if products_at_level.empty:
+                    st.success(empty_message)
+                else:
+                    styled = (
+                        products_at_level[alert_columns]
+                        .sort_values(["Sugestão de compra", "Saldo atual"], ascending=[False, True])
+                        .style.format(alert_formats)
+                        .apply(lambda row, bg=color: [f"background-color: {bg}"] * len(row), axis=1)
+                    )
+                    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+        st.subheader("📈 Visão geral")
+        chart1, chart2 = st.columns([1, 2])
+        status_summary = (
+            active.groupby("Criticidade", as_index=False)["ID"]
+            .count().rename(columns={"ID": "Produtos"})
+        )
+        fig_status = px.pie(
+            status_summary, names="Criticidade", values="Produtos", hole=0.66,
+            color="Criticidade",
+            color_discrete_map={"Adequado": "#22c55e", "Atenção": "#f59e0b", "Crítico": "#ef4444"},
+        )
+        fig_status.update_layout(
+            title="Distribuição por criticidade", margin=dict(l=10, r=10, t=50, b=10),
+            legend_title="",
+        )
+        chart1.plotly_chart(fig_status, use_container_width=True)
+
+        top = active.nlargest(12, "Consumo médio mensal").sort_values("Consumo médio mensal")
+        fig_top = px.bar(
+            top, x="Consumo médio mensal", y="Produto", orientation="h",
+            color="Criticidade",
+            color_discrete_map={"Adequado": "#22c55e", "Atenção": "#f59e0b", "Crítico": "#ef4444"},
+        )
+        fig_top.update_layout(
+            title="Produtos com maior consumo mensal", margin=dict(l=10, r=10, t=50, b=10),
+            yaxis_title="", legend_title="",
+        )
+        chart2.plotly_chart(fig_top, use_container_width=True)
+
+        title_col, restore_col = st.columns([4, 1])
+        title_col.subheader("🧾 Lista de produtos")
+        if inactive_ids:
+            if restore_col.button(
+                f"Reexibir ocultos ({len(inactive_ids)})", use_container_width=True
+            ):
+                st.session_state.dashboard_inactive_products = []
+                save_dashboard_state(inactive_product_ids=[])
+                st.rerun()
+        else:
+            restore_col.caption("Nenhum item oculto")
+        st.caption(
+            "Marque ‘Ocultar’ na própria linha para retirar um produto dos visuais. "
+            "Isso não altera o cadastro no Bling."
+        )
+        product_columns = [
+            "ID", "Sinal", "Código", "Produto", "Categoria", "Saldo atual",
+            "Consumo médio semanal", "Consumo médio mensal", "Cobertura (semanas)",
+            "Sugestão de compra", "Motivo do alerta",
+        ]
+        product_editor = filtered[product_columns].copy()
+        product_editor.insert(0, "Ocultar", False)
+        product_editor["Cobertura (semanas)"] = product_editor["Cobertura (semanas)"].replace(
+            [float("inf")], None
+        )
+        edited_products = st.data_editor(
+            product_editor.sort_values(
+                ["Criticidade"] if "Criticidade" in product_editor.columns else ["Produto"]
+            ),
+            hide_index=True, use_container_width=True,
+            disabled=[column for column in product_editor.columns if column != "Ocultar"],
+            column_config={
+                "Ocultar": st.column_config.CheckboxColumn(
+                    "Ocultar", help="Oculta esta linha somente no dashboard."
+                ),
+                "ID": None,
+                "Saldo atual": st.column_config.NumberColumn(format="%.1f"),
+                "Consumo médio semanal": st.column_config.NumberColumn(format="%.1f"),
+                "Consumo médio mensal": st.column_config.NumberColumn(format="%.1f"),
+                "Cobertura (semanas)": st.column_config.NumberColumn(format="%.1f"),
+                "Sugestão de compra": st.column_config.NumberColumn(format="%.1f"),
+            },
+            key="inline_product_visibility",
+        )
+        ids_to_hide = set(
+            edited_products.loc[edited_products["Ocultar"], "ID"].astype(int)
+        )
+        if ids_to_hide:
+            saved_ids = sorted(inactive_ids | ids_to_hide)
+            st.session_state.dashboard_inactive_products = saved_ids
+            save_dashboard_state(inactive_product_ids=saved_ids)
+            st.rerun()
+
+        export_columns = [column for column in product_columns if column != "ID"]
+        csv = filtered[export_columns].to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+        st.download_button(
+            "Baixar produtos filtrados (CSV)", csv,
+            file_name=f"estoque_ultra_loot_{datetime.now():%Y%m%d_%H%M}.csv",
+            mime="text/csv",
+        )
+
+    with abc_tab:
+        st.subheader("📊 Análise da Curva ABC")
+        st.caption(
+            "A concentra os produtos que representam aproximadamente 80% do consumo; "
+            "B, os próximos 15%; e C, os demais 5%."
+        )
+        abc_filter = st.multiselect(
+            "Classes exibidas", ["A", "B", "C"], default=["A", "B", "C"]
+        )
+        abc_data = active[active["Curva ABC"].isin(abc_filter)].copy()
+        a1, a2, a3 = st.columns(3)
+        metric_card(a1, "Produtos classe A", br_number((active["Curva ABC"] == "A").sum()), "#7c3aed")
+        metric_card(a2, "Produtos classe B", br_number((active["Curva ABC"] == "B").sum()), "#f97316")
+        metric_card(a3, "Produtos classe C", br_number((active["Curva ABC"] == "C").sum()), "#64748b")
+
+        abc_chart, abc_rank = st.columns([1, 2])
+        abc_summary = (
+            abc_data.groupby("Curva ABC", as_index=False)["Consumo no período"].sum()
+        )
+        fig_abc = px.pie(
+            abc_summary, names="Curva ABC", values="Consumo no período", hole=0.66,
+            category_orders={"Curva ABC": ["A", "B", "C"]}, color="Curva ABC",
+            color_discrete_map={"A": "#7c3aed", "B": "#f97316", "C": "#94a3b8"},
+        )
+        fig_abc.update_layout(
+            title="Participação no consumo", margin=dict(l=10, r=10, t=50, b=10),
+            legend_title="Classe",
+        )
+        abc_chart.plotly_chart(fig_abc, use_container_width=True)
+        abc_rank.dataframe(
+            abc_data[[
+                "Curva ABC", "Código", "Produto", "Categoria", "Consumo no período",
+                "Consumo médio mensal", "Saldo atual", "Criticidade",
+            ]].sort_values(["Curva ABC", "Consumo no período"], ascending=[True, False]),
+            hide_index=True, use_container_width=True,
+            column_config={
+                "Consumo no período": st.column_config.NumberColumn(format="%.1f"),
+                "Consumo médio mensal": st.column_config.NumberColumn(format="%.1f"),
+                "Saldo atual": st.column_config.NumberColumn(format="%.1f"),
+            },
+        )
+    return
 
     active = filtered[filtered["Situação"] == "Ativo"]
     k1, k2, k3, k4, k5 = st.columns(5)
