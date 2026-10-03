@@ -41,8 +41,12 @@ autorização após o encerramento da sessão.
 - Saldo atual: saldo virtual do Bling, já descontadas as reservas.
 - Custo cadastrado: `precoCusto` do fornecedor padrão, obtido em
   `GET /produtos/fornecedores`; inclui o rateio de frete, descontos e impostos.
+  Quando estiver vazio ou zerado, o dashboard utiliza `precoCompra` como
+  alternativa. Se os dois estiverem ausentes, preserva o custo já retornado no
+  cadastro do produto.
 - Valor do estoque a preço de venda: saldo virtual positivo × preço de venda.
-- Valor do estoque a preço de custo: saldo virtual positivo × custo cadastrado.
+- Valor do estoque a custo/compra: saldo virtual positivo × custo cadastrado ou,
+  na ausência dele, preço de compra.
 - Consumo: quantidade dos itens de pedidos não cancelados; se nenhum item for
   encontrado, usa NFC-e autorizadas, emitidas ou registradas no período.
 - Cobertura: saldo atual dividido pelo consumo médio semanal ou mensal.

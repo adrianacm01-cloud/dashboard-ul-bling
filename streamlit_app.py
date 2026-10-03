@@ -314,24 +314,37 @@ def fetch_product_supplier_costs(
         return {}, warnings
 
     costs: dict[int, float] = {}
+    cost_sources: dict[int, str] = {}
     preferred: set[int] = set()
     for supplier in suppliers:
         product_id = nested_value(supplier, "produto.id", "idProduto")
         if product_id is None:
             continue
         product_id = int(product_id)
-        cost = number(
-            nested_value(supplier, "precoCusto", "precoCompra", default=0)
-        )
+        registered_cost = number(supplier.get("precoCusto"))
+        purchase_price = number(supplier.get("precoCompra"))
+        cost = registered_cost if registered_cost > 0 else purchase_price
+        used_purchase_price = registered_cost <= 0 and purchase_price > 0
         is_default = bool(supplier.get("padrao"))
         if product_id not in costs or (is_default and product_id not in preferred):
             costs[product_id] = cost
+            cost_sources[product_id] = (
+                "precoCompra" if used_purchase_price else "precoCusto"
+            )
         if is_default:
             preferred.add(product_id)
     if not costs:
         warnings.append(
             "A API não retornou custos de fornecedores; confira os cadastros "
             "e o escopo Produtos - Fornecedores no aplicativo Bling."
+        )
+    purchase_price_fallbacks = sum(
+        source == "precoCompra" for source in cost_sources.values()
+    )
+    if costs and purchase_price_fallbacks:
+        warnings.append(
+            f"{purchase_price_fallbacks} produto(s) sem preço de custo utilizaram "
+            "o preço de compra cadastrado como alternativa."
         )
     return costs, warnings
 
@@ -830,7 +843,8 @@ def apply_costs(inventory: pd.DataFrame, costs: dict[int, float]) -> pd.DataFram
     df = inventory.copy()
     if costs:
         mapped = df["ID"].map(costs)
-        df["Custo cadastrado"] = mapped.fillna(df["Custo cadastrado"])
+        valid_mapped = mapped.where(mapped > 0)
+        df["Custo cadastrado"] = valid_mapped.fillna(df["Custo cadastrado"])
     positive_stock = df["Saldo atual"].clip(lower=0)
     df["Valor em estoque"] = df["Custo cadastrado"] * positive_stock
     df["Valor em estoque (custo)"] = df["Valor em estoque"]
@@ -1392,7 +1406,7 @@ def dashboard(client_id: str, client_secret: str) -> None:
             br_currency(active["Valor em estoque (venda)"].sum()), "#0ea5e9",
         )
         metric_card(
-            value_cards[1], "Valor do estoque a preço de custo",
+            value_cards[1], "Valor do estoque a custo/compra",
             br_currency(active["Valor em estoque (custo)"].sum()), "#14b8a6",
         )
 
@@ -1500,9 +1514,13 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 "ID": None,
                 "Saldo atual": st.column_config.NumberColumn(format="%.1f"),
                 "Preço": st.column_config.NumberColumn(format="R$ %.2f"),
-                "Custo cadastrado": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Custo cadastrado": st.column_config.NumberColumn(
+                    "Custo/compra utilizado", format="R$ %.2f"
+                ),
                 "Valor em estoque (venda)": st.column_config.NumberColumn(format="R$ %.2f"),
-                "Valor em estoque (custo)": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Valor em estoque (custo)": st.column_config.NumberColumn(
+                    "Valor em estoque (custo/compra)", format="R$ %.2f"
+                ),
                 "Consumo médio semanal": st.column_config.NumberColumn(format="%.1f"),
                 "Consumo médio mensal": st.column_config.NumberColumn(format="%.1f"),
                 "Cobertura (semanas)": st.column_config.NumberColumn(format="%.1f"),
