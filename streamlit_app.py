@@ -1380,8 +1380,8 @@ def dashboard(client_id: str, client_secret: str) -> None:
         else:
             restore_col.caption("Nenhum item oculto")
         st.caption(
-            "Marque ‘Ocultar’ na própria linha para retirar um produto dos visuais. "
-            "Isso não altera o cadastro no Bling."
+            "Selecione quantos produtos desejar na coluna ‘Ocultar’ e depois clique "
+            "em ‘Ocultar itens selecionados’. Isso não altera o cadastro no Bling."
         )
         product_columns = [
             "ID", "Sinal", "Código", "Produto", "Categoria", "Saldo atual",
@@ -1415,7 +1415,17 @@ def dashboard(client_id: str, client_secret: str) -> None:
         ids_to_hide = set(
             edited_products.loc[edited_products["Ocultar"], "ID"].astype(int)
         )
-        if ids_to_hide:
+        hide_col, selected_col = st.columns([1, 3])
+        hide_selected = hide_col.button(
+            "Ocultar itens selecionados",
+            type="primary",
+            use_container_width=True,
+            disabled=not ids_to_hide,
+        )
+        selected_col.caption(
+            f"{len(ids_to_hide)} produto(s) selecionado(s) para ocultar."
+        )
+        if hide_selected:
             saved_ids = sorted(inactive_ids | ids_to_hide)
             st.session_state.dashboard_inactive_products = saved_ids
             save_dashboard_state(inactive_product_ids=saved_ids)
