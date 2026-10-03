@@ -295,6 +295,47 @@ def fetch_categories_by_product_filter(
     return product_categories, audit, warnings
 
 
+def fetch_product_supplier_costs(
+    client_id: str, client_secret: str
+) -> tuple[dict[int, float], list[str]]:
+    """Return the preferred supplier cost for each product."""
+    warnings: list[str] = []
+    try:
+        suppliers = fetch_all("produtos/fornecedores", client_id, client_secret)
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 403:
+            warnings.append(
+                "Sem permissão de leitura de Produtos - Fornecedores; "
+                "o valor pelo custo pode ficar zerado."
+            )
+        else:
+            detail = exc.response.text if exc.response is not None else str(exc)
+            warnings.append(f"Não foi possível consultar os custos: {detail}")
+        return {}, warnings
+
+    costs: dict[int, float] = {}
+    preferred: set[int] = set()
+    for supplier in suppliers:
+        product_id = nested_value(supplier, "produto.id", "idProduto")
+        if product_id is None:
+            continue
+        product_id = int(product_id)
+        cost = number(
+            nested_value(supplier, "precoCusto", "precoCompra", default=0)
+        )
+        is_default = bool(supplier.get("padrao"))
+        if product_id not in costs or (is_default and product_id not in preferred):
+            costs[product_id] = cost
+        if is_default:
+            preferred.add(product_id)
+    if not costs:
+        warnings.append(
+            "A API não retornou custos de fornecedores; confira os cadastros "
+            "e o escopo Produtos - Fornecedores no aplicativo Bling."
+        )
+    return costs, warnings
+
+
 def fetch_product_metadata(
     products: list[dict], client_id: str, client_secret: str
 ) -> tuple[dict[int, str], dict[int, float], list[str], list[dict]]:
@@ -746,7 +787,18 @@ def normalize_inventory(
     df["Valor em estoque"] = (
         df["Custo cadastrado"] * df["Saldo atual"].clip(lower=0)
     )
+    df["Valor em estoque (custo)"] = df["Valor em estoque"]
+    df["Valor em estoque (venda)"] = (
+        df["Preço"] * df["Saldo atual"].clip(lower=0)
+    )
     df["Valor de consumo"] = df["Consumo no período"] * df["Custo cadastrado"]
+    df["Valor em estoque"] = (
+        df["Custo cadastrado"] * df["Saldo atual"].clip(lower=0)
+    )
+    df["Valor em estoque (custo)"] = df["Valor em estoque"]
+    df["Valor em estoque (venda)"] = (
+        df["Preço"] * df["Saldo atual"].clip(lower=0)
+    )
     return df
 
 
@@ -770,6 +822,19 @@ def apply_consumption(
         axis=1,
     )
     df["Cobertura (meses)"] = df["Cobertura (semanas)"] / (30.4375 / 7)
+    df["Valor de consumo"] = df["Consumo no período"] * df["Custo cadastrado"]
+    return df
+
+
+def apply_costs(inventory: pd.DataFrame, costs: dict[int, float]) -> pd.DataFrame:
+    df = inventory.copy()
+    if costs:
+        mapped = df["ID"].map(costs)
+        df["Custo cadastrado"] = mapped.fillna(df["Custo cadastrado"])
+    positive_stock = df["Saldo atual"].clip(lower=0)
+    df["Valor em estoque"] = df["Custo cadastrado"] * positive_stock
+    df["Valor em estoque (custo)"] = df["Valor em estoque"]
+    df["Valor em estoque (venda)"] = df["Preço"] * positive_stock
     df["Valor de consumo"] = df["Consumo no período"] * df["Custo cadastrado"]
     return df
 
@@ -995,9 +1060,9 @@ def dashboard(client_id: str, client_secret: str) -> None:
             )
             st.session_state.analytics_loaded = False
         run_categories = st.button(
-            "Atualizar categorias",
+            "Atualizar categorias e custos",
             use_container_width=True,
-            help="Consulta as categorias e seus produtos sem carregar pedidos ou custos.",
+            help="Consulta categorias e custos dos fornecedores sem carregar pedidos.",
         )
         run_analytics = st.button(
             "Atualizar consumo",
@@ -1052,6 +1117,13 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 if saved_categories:
                     mapped = inventory["ID"].map(saved_categories)
                     inventory["Categoria"] = mapped.fillna(inventory["Categoria"])
+                saved_costs = {
+                    int(product_id): number(cost)
+                    for product_id, cost in persisted_state.get(
+                        "product_costs", {}
+                    ).items()
+                }
+                inventory = apply_costs(inventory, saved_costs)
                 st.session_state.inventory = inventory
                 st.session_state.inventory_warnings = []
                 st.session_state.order_count = 0
@@ -1084,16 +1156,20 @@ def dashboard(client_id: str, client_secret: str) -> None:
 
     if run_categories or auto_sync_required:
         try:
-            with st.spinner("Sincronizando somente categorias..."):
+            with st.spinner("Sincronizando categorias e custos..."):
                 category_map, category_audit, category_warnings = (
                     fetch_categories_by_product_filter(client_id, client_secret)
+                )
+                product_costs, cost_warnings = fetch_product_supplier_costs(
+                    client_id, client_secret
                 )
                 inventory = st.session_state.inventory.copy()
                 mapped = inventory["ID"].map(category_map)
                 inventory["Categoria"] = mapped.fillna("Sem categoria")
+                inventory = apply_costs(inventory, product_costs)
                 st.session_state.inventory = inventory
                 st.session_state.category_audit = category_audit
-                st.session_state.inventory_warnings = category_warnings
+                st.session_state.inventory_warnings = category_warnings + cost_warnings
                 st.session_state.categories_loaded = True
                 save_dashboard_state(
                     product_categories={
@@ -1101,6 +1177,10 @@ def dashboard(client_id: str, client_secret: str) -> None:
                         for product_id, category in category_map.items()
                     },
                     category_audit=category_audit,
+                    product_costs={
+                        str(product_id): cost
+                        for product_id, cost in product_costs.items()
+                    },
                     categories_updated_at=datetime.now(timezone.utc).isoformat(),
                 )
                 st.session_state.updated_at = datetime.now(
@@ -1112,6 +1192,9 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 diagnostics["Categorias com produtos"] = sum(
                     int(item["Produtos retornados pelo filtro"] > 0)
                     for item in category_audit
+                )
+                diagnostics["Produtos com custo cadastrado"] = sum(
+                    value > 0 for value in product_costs.values()
                 )
                 st.session_state.sync_diagnostics = diagnostics
             if run_categories and not auto_sync_required:
@@ -1303,6 +1386,15 @@ def dashboard(client_id: str, client_secret: str) -> None:
             cards[4], "Sugestão de compra",
             br_number(active["Sugestão de compra"].sum(), 1), "#22c55e",
         )
+        value_cards = st.columns(2)
+        metric_card(
+            value_cards[0], "Valor do estoque a preço de venda",
+            br_currency(active["Valor em estoque (venda)"].sum()), "#0ea5e9",
+        )
+        metric_card(
+            value_cards[1], "Valor do estoque a preço de custo",
+            br_currency(active["Valor em estoque (custo)"].sum()), "#14b8a6",
+        )
 
         st.markdown('<div class="ul-section"></div>', unsafe_allow_html=True)
         st.subheader("🚨 Fila de reposição")
@@ -1380,11 +1472,13 @@ def dashboard(client_id: str, client_secret: str) -> None:
         else:
             restore_col.caption("Nenhum item oculto")
         st.caption(
-            "Marque ‘Ocultar’ na própria linha para retirar um produto dos visuais. "
-            "Isso não altera o cadastro no Bling."
+            "Selecione quantos produtos desejar na coluna ‘Ocultar’ e depois clique "
+            "em ‘Ocultar itens selecionados’. Isso não altera o cadastro no Bling."
         )
         product_columns = [
             "ID", "Sinal", "Código", "Produto", "Categoria", "Saldo atual",
+            "Preço", "Custo cadastrado", "Valor em estoque (venda)",
+            "Valor em estoque (custo)",
             "Consumo médio semanal", "Consumo médio mensal", "Cobertura (semanas)",
             "Sugestão de compra", "Motivo do alerta",
         ]
@@ -1405,6 +1499,10 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 ),
                 "ID": None,
                 "Saldo atual": st.column_config.NumberColumn(format="%.1f"),
+                "Preço": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Custo cadastrado": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Valor em estoque (venda)": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Valor em estoque (custo)": st.column_config.NumberColumn(format="R$ %.2f"),
                 "Consumo médio semanal": st.column_config.NumberColumn(format="%.1f"),
                 "Consumo médio mensal": st.column_config.NumberColumn(format="%.1f"),
                 "Cobertura (semanas)": st.column_config.NumberColumn(format="%.1f"),
@@ -1415,7 +1513,17 @@ def dashboard(client_id: str, client_secret: str) -> None:
         ids_to_hide = set(
             edited_products.loc[edited_products["Ocultar"], "ID"].astype(int)
         )
-        if ids_to_hide:
+        hide_col, selected_col = st.columns([1, 3])
+        hide_selected = hide_col.button(
+            "Ocultar itens selecionados",
+            type="primary",
+            use_container_width=True,
+            disabled=not ids_to_hide,
+        )
+        selected_col.caption(
+            f"{len(ids_to_hide)} produto(s) selecionado(s) para ocultar."
+        )
+        if hide_selected:
             saved_ids = sorted(inactive_ids | ids_to_hide)
             st.session_state.dashboard_inactive_products = saved_ids
             save_dashboard_state(inactive_product_ids=saved_ids)

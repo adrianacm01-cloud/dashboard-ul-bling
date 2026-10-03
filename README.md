@@ -39,8 +39,10 @@ autorização após o encerramento da sessão.
 ## Critérios dos indicadores
 
 - Saldo atual: saldo virtual do Bling, já descontadas as reservas.
-- Custo cadastrado: `precoCusto` do fornecedor padrão; a API não fornece um
-  campo separado de custo médio.
+- Custo cadastrado: `precoCusto` do fornecedor padrão, obtido em
+  `GET /produtos/fornecedores`; inclui o rateio de frete, descontos e impostos.
+- Valor do estoque a preço de venda: saldo virtual positivo × preço de venda.
+- Valor do estoque a preço de custo: saldo virtual positivo × custo cadastrado.
 - Consumo: quantidade dos itens de pedidos não cancelados; se nenhum item for
   encontrado, usa NFC-e autorizadas, emitidas ou registradas no período.
 - Cobertura: saldo atual dividido pelo consumo médio semanal ou mensal.
