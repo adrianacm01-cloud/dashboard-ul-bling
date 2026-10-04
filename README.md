@@ -23,11 +23,29 @@ nessa ordem. Os botões laterais permanecem disponíveis para atualizações man
 ```toml
 BLING_CLIENT_ID = "..."
 BLING_CLIENT_SECRET = "..."
+DATABASE_URL = "postgresql://...pooler.supabase.com:5432/postgres?sslmode=require"
 ```
 
 6. No Bling, adicione os escopos de leitura de produtos, estoques e pedidos de
    venda e salve o app.
 7. Abra o Streamlit e autorize a conta.
+
+## Cache PostgreSQL e sincronização incremental
+
+Com `DATABASE_URL` configurada, o aplicativo cria automaticamente as tabelas
+`ul_product_metadata`, `ul_daily_consumption`, `ul_sync_state` e
+`ul_hidden_products`. Nenhuma migração manual é necessária.
+
+- A primeira carga importa até 180 dias, que é o maior período disponível no painel.
+- Categorias e custos são reutilizados do banco nas próximas sessões.
+- A atualização seguinte consulta somente os últimos três dias anteriores à
+  última sincronização, além do dia atual. Essa sobreposição captura alterações
+  e cancelamentos recentes.
+- O consumo é armazenado por dia e produto, permitindo trocar entre 30, 60, 90
+  e 180 dias sem consultar novamente todos os pedidos.
+- Uma carga parcial com falha de detalhamento não substitui dados válidos já
+  armazenados.
+- Sem banco disponível, o painel mantém o fluxo tradicional como contingência.
 
 ## Segurança
 
@@ -41,8 +59,12 @@ autorização após o encerramento da sessão.
 - Saldo atual: saldo virtual do Bling, já descontadas as reservas.
 - Custo cadastrado: `precoCusto` do fornecedor padrão, obtido em
   `GET /produtos/fornecedores`; inclui o rateio de frete, descontos e impostos.
+  Quando estiver vazio ou zerado, o dashboard utiliza `precoCompra` como
+  alternativa. Se os dois estiverem ausentes, preserva o custo já retornado no
+  cadastro do produto.
 - Valor do estoque a preço de venda: saldo virtual positivo × preço de venda.
-- Valor do estoque a preço de custo: saldo virtual positivo × custo cadastrado.
+- Valor do estoque a custo/compra: saldo virtual positivo × custo cadastrado ou,
+  na ausência dele, preço de compra.
 - Consumo: quantidade dos itens de pedidos não cancelados; se nenhum item for
   encontrado, usa NFC-e autorizadas, emitidas ou registradas no período.
 - Cobertura: saldo atual dividido pelo consumo médio semanal ou mensal.

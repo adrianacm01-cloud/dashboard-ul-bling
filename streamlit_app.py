@@ -12,6 +12,8 @@ from urllib.parse import urlencode
 
 import pandas as pd
 import plotly.express as px
+import psycopg2
+from psycopg2.extras import execute_values
 import requests
 import streamlit as st
 
@@ -21,6 +23,8 @@ TOKEN_URL = "https://api.bling.com.br/Api/v3/oauth/token"
 API_URL = "https://api.bling.com.br/Api/v3"
 REQUEST_INTERVAL = 0.36
 STATE_FILE = Path(__file__).with_name("dashboard_state.json")
+INITIAL_HISTORY_DAYS = 180
+SYNC_OVERLAP_DAYS = 3
 
 st.set_page_config(
     page_title="Ultra Loot | Estoque",
@@ -89,6 +93,175 @@ def save_dashboard_state(**changes) -> None:
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     os.replace(temporary, STATE_FILE)
+
+
+def database_url() -> str:
+    return str(st.secrets.get("DATABASE_URL", "")).strip()
+
+
+def db_connect():
+    return psycopg2.connect(database_url(), connect_timeout=12)
+
+
+def initialize_database() -> bool:
+    if not database_url():
+        return False
+    with db_connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ul_product_metadata (
+                product_id BIGINT PRIMARY KEY,
+                category TEXT NOT NULL DEFAULT 'Sem categoria',
+                cost NUMERIC NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS ul_daily_consumption (
+                sale_date DATE NOT NULL,
+                product_id BIGINT NOT NULL,
+                source TEXT NOT NULL,
+                quantity NUMERIC NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (sale_date, product_id, source)
+            );
+            CREATE TABLE IF NOT EXISTS ul_sync_state (
+                sync_key TEXT PRIMARY KEY,
+                sync_value TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS ul_hidden_products (
+                product_id BIGINT PRIMARY KEY,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+    return True
+
+
+def db_get_state(key: str, default: str = "") -> str:
+    with db_connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT sync_value FROM ul_sync_state WHERE sync_key = %s", (key,)
+        )
+        row = cursor.fetchone()
+    return str(row[0]) if row else default
+
+
+def db_set_state(key: str, value: str) -> None:
+    with db_connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO ul_sync_state (sync_key, sync_value, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (sync_key) DO UPDATE
+            SET sync_value = EXCLUDED.sync_value, updated_at = NOW()
+            """,
+            (key, value),
+        )
+
+
+def db_load_product_metadata() -> tuple[dict[int, str], dict[int, float]]:
+    categories: dict[int, str] = {}
+    costs: dict[int, float] = {}
+    with db_connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT product_id, category, cost FROM ul_product_metadata")
+        for product_id, category, cost in cursor.fetchall():
+            categories[int(product_id)] = str(category)
+            costs[int(product_id)] = number(cost)
+    return categories, costs
+
+
+def db_save_product_metadata(
+    categories: dict[int, str], costs: dict[int, float]
+) -> None:
+    product_ids = set(categories) | set(costs)
+    rows = [
+        (
+            product_id,
+            categories.get(product_id, "Sem categoria"),
+            costs.get(product_id, 0),
+        )
+        for product_id in product_ids
+    ]
+    if not rows:
+        return
+    with db_connect() as connection, connection.cursor() as cursor:
+        execute_values(
+            cursor,
+            """
+            INSERT INTO ul_product_metadata (product_id, category, cost, updated_at)
+            VALUES %s
+            ON CONFLICT (product_id) DO UPDATE SET
+                category = EXCLUDED.category,
+                cost = CASE WHEN EXCLUDED.cost > 0 THEN EXCLUDED.cost
+                            ELSE ul_product_metadata.cost END,
+                updated_at = NOW()
+            """,
+            rows,
+            template="(%s, %s, %s, NOW())",
+        )
+
+
+def db_replace_daily_consumption(
+    start_date: date,
+    source: str,
+    daily: dict[tuple[date, int], float],
+) -> None:
+    rows = [
+        (sale_date, product_id, source, quantity)
+        for (sale_date, product_id), quantity in daily.items()
+    ]
+    with db_connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM ul_daily_consumption WHERE source = %s AND sale_date >= %s",
+            (source, start_date),
+        )
+        if rows:
+            execute_values(
+                cursor,
+                """
+                INSERT INTO ul_daily_consumption
+                    (sale_date, product_id, source, quantity, updated_at)
+                VALUES %s
+                ON CONFLICT (sale_date, product_id, source) DO UPDATE SET
+                    quantity = EXCLUDED.quantity, updated_at = NOW()
+                """,
+                rows,
+                template="(%s, %s, %s, %s, NOW())",
+            )
+
+
+def db_load_consumption(start_date: date, end_date: date, source: str) -> dict[int, float]:
+    result: dict[int, float] = {}
+    with db_connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT product_id, SUM(quantity)
+            FROM ul_daily_consumption
+            WHERE source = %s AND sale_date BETWEEN %s AND %s
+            GROUP BY product_id
+            """,
+            (source, start_date, end_date),
+        )
+        for product_id, quantity in cursor.fetchall():
+            result[int(product_id)] = number(quantity)
+    return result
+
+
+def db_load_hidden_products() -> list[int]:
+    with db_connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT product_id FROM ul_hidden_products")
+        return [int(row[0]) for row in cursor.fetchall()]
+
+
+def db_save_hidden_products(product_ids: list[int]) -> None:
+    with db_connect() as connection, connection.cursor() as cursor:
+        cursor.execute("DELETE FROM ul_hidden_products")
+        if product_ids:
+            execute_values(
+                cursor,
+                "INSERT INTO ul_hidden_products (product_id) VALUES %s",
+                [(product_id,) for product_id in product_ids],
+            )
 
 
 def create_state(client_secret: str) -> str:
@@ -314,24 +487,37 @@ def fetch_product_supplier_costs(
         return {}, warnings
 
     costs: dict[int, float] = {}
+    cost_sources: dict[int, str] = {}
     preferred: set[int] = set()
     for supplier in suppliers:
         product_id = nested_value(supplier, "produto.id", "idProduto")
         if product_id is None:
             continue
         product_id = int(product_id)
-        cost = number(
-            nested_value(supplier, "precoCusto", "precoCompra", default=0)
-        )
+        registered_cost = number(supplier.get("precoCusto"))
+        purchase_price = number(supplier.get("precoCompra"))
+        cost = registered_cost if registered_cost > 0 else purchase_price
+        used_purchase_price = registered_cost <= 0 and purchase_price > 0
         is_default = bool(supplier.get("padrao"))
         if product_id not in costs or (is_default and product_id not in preferred):
             costs[product_id] = cost
+            cost_sources[product_id] = (
+                "precoCompra" if used_purchase_price else "precoCusto"
+            )
         if is_default:
             preferred.add(product_id)
     if not costs:
         warnings.append(
             "A API não retornou custos de fornecedores; confira os cadastros "
             "e o escopo Produtos - Fornecedores no aplicativo Bling."
+        )
+    purchase_price_fallbacks = sum(
+        source == "precoCompra" for source in cost_sources.values()
+    )
+    if costs and purchase_price_fallbacks:
+        warnings.append(
+            f"{purchase_price_fallbacks} produto(s) sem preço de custo utilizaram "
+            "o preço de compra cadastrado como alternativa."
         )
     return costs, warnings
 
@@ -482,6 +668,20 @@ def add_document_items(
     return item_count
 
 
+def document_date(detail: dict, fallback: dict, default: date) -> date:
+    raw = nested_value(
+        detail, "data", "dataEmissao", "dataOperacao",
+        default=nested_value(fallback, "data", "dataEmissao", default=""),
+    )
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).date()
+    except (TypeError, ValueError):
+        try:
+            return datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return default
+
+
 def fetch_invoice_consumption(
     resource: str,
     start_date: date,
@@ -489,7 +689,7 @@ def fetch_invoice_consumption(
     client_id: str,
     client_secret: str,
     product_id_by_code: dict[str, int],
-) -> tuple[dict[int, float], int, int, list[str]]:
+) -> tuple[dict[int, float], dict[tuple[date, int], float], int, int, list[str]]:
     warnings: list[str] = []
     try:
         documents = fetch_all(
@@ -507,7 +707,7 @@ def fetch_invoice_consumption(
             f"A fonte {resource.upper()} não pôde ser consultada ({status}). "
             "Confirme o escopo de leitura desse documento no aplicativo Bling."
         )
-        return {}, 0, 0, warnings
+        return {}, {}, 0, 0, warnings
 
     # A API define 5=Autorizada, 6=Emitida DANFE e 7=Registrada.
     valid_statuses = {5, 6, 7}
@@ -517,6 +717,7 @@ def fetch_invoice_consumption(
         in valid_statuses
     ]
     consumption: dict[int, float] = {}
+    daily: dict[tuple[date, int], float] = {}
     item_count = 0
     failed = 0
     label = "NFC-e" if resource == "nfce" else "NF-e"
@@ -527,16 +728,20 @@ def fetch_invoice_consumption(
             detail = api_get(
                 f"{resource}/{int(document['id'])}", {}, client_id, client_secret
             ).get("data", {})
-            item_count += add_document_items(
-                detail, consumption, product_id_by_code
-            )
+            document_consumption: dict[int, float] = {}
+            item_count += add_document_items(detail, document_consumption, product_id_by_code)
+            sale_date = document_date(detail, document, end_date)
+            for product_id, quantity in document_consumption.items():
+                consumption[product_id] = consumption.get(product_id, 0.0) + quantity
+                key = (sale_date, product_id)
+                daily[key] = daily.get(key, 0.0) + quantity
         except (requests.RequestException, KeyError, TypeError, ValueError):
             failed += 1
         progress.progress(index / total, text=f"Calculando consumo pelas {label}...")
     progress.empty()
     if failed:
         warnings.append(f"{failed} documento(s) de {label} não puderam ser detalhados.")
-    return consumption, len(valid_documents), item_count, warnings
+    return consumption, daily, len(valid_documents), item_count, warnings
 
 
 def fetch_sales_consumption(
@@ -545,7 +750,14 @@ def fetch_sales_consumption(
     client_id: str,
     client_secret: str,
     product_id_by_code: dict[str, int],
-) -> tuple[dict[int, float], int, int, str, list[str]]:
+    preferred_source: str = "",
+) -> tuple[dict[int, float], dict[tuple[date, int], float], int, int, str, list[str]]:
+    if preferred_source == "NFC-e":
+        consumption, daily, count, items, warnings = fetch_invoice_consumption(
+            "nfce", start_date, end_date, client_id, client_secret,
+            product_id_by_code,
+        )
+        return consumption, daily, count, items, "NFC-e", warnings
     orders = fetch_all(
         "pedidos/vendas",
         client_id,
@@ -573,6 +785,7 @@ def fetch_sales_consumption(
             valid_orders.append(order)
 
     consumption: dict[int, float] = {}
+    daily: dict[tuple[date, int], float] = {}
     item_count = 0
     failed_orders = 0
     progress = st.progress(0, text="Calculando consumo pelos pedidos de venda...")
@@ -586,7 +799,13 @@ def fetch_sales_consumption(
             failed_orders += 1
             progress.progress(index / total, text="Calculando consumo pelos pedidos de venda...")
             continue
-        item_count += add_document_items(detail, consumption, product_id_by_code)
+        document_consumption: dict[int, float] = {}
+        item_count += add_document_items(detail, document_consumption, product_id_by_code)
+        sale_date = document_date(detail, order, end_date)
+        for product_id, quantity in document_consumption.items():
+            consumption[product_id] = consumption.get(product_id, 0.0) + quantity
+            key = (sale_date, product_id)
+            daily[key] = daily.get(key, 0.0) + quantity
         progress.progress(index / total, text="Calculando consumo pelos pedidos de venda...")
     progress.empty()
     if orders and not any(situation_names.values()):
@@ -600,13 +819,16 @@ def fetch_sales_consumption(
             "ignorados no cálculo de consumo."
         )
     if item_count > 0:
-        return consumption, len(valid_orders), item_count, "Pedidos de venda", warnings
+        return consumption, daily, len(valid_orders), item_count, "Pedidos de venda", warnings
+
+    if preferred_source == "Pedidos de venda":
+        return consumption, daily, len(valid_orders), item_count, preferred_source, warnings
 
     warnings.append(
         "Os pedidos de venda não trouxeram itens vinculados aos produtos; "
         "o painel tentou usar as NFC-e do mesmo período."
     )
-    invoice_consumption, document_count, invoice_items, invoice_warnings = (
+    invoice_consumption, invoice_daily, document_count, invoice_items, invoice_warnings = (
         fetch_invoice_consumption(
             "nfce", start_date, end_date, client_id, client_secret,
             product_id_by_code,
@@ -615,6 +837,7 @@ def fetch_sales_consumption(
     warnings.extend(invoice_warnings)
     return (
         invoice_consumption,
+        invoice_daily,
         document_count,
         invoice_items,
         "NFC-e" if invoice_items else "Nenhuma fonte com itens",
@@ -830,7 +1053,8 @@ def apply_costs(inventory: pd.DataFrame, costs: dict[int, float]) -> pd.DataFram
     df = inventory.copy()
     if costs:
         mapped = df["ID"].map(costs)
-        df["Custo cadastrado"] = mapped.fillna(df["Custo cadastrado"])
+        valid_mapped = mapped.where(mapped > 0)
+        df["Custo cadastrado"] = valid_mapped.fillna(df["Custo cadastrado"])
     positive_stock = df["Saldo atual"].clip(lower=0)
     df["Valor em estoque"] = df["Custo cadastrado"] * positive_stock
     df["Valor em estoque (custo)"] = df["Valor em estoque"]
@@ -928,7 +1152,7 @@ def load_inventory(
             str(item.get("codigo") or "").strip().casefold(): int(item["id"])
             for item in products if item.get("id") and item.get("codigo")
         }
-        consumption, order_count, item_count, source, sales_warnings = fetch_sales_consumption(
+        consumption, _daily, order_count, item_count, source, sales_warnings = fetch_sales_consumption(
             start_date, end_date, client_id, client_secret, product_id_by_code
         )
         warnings.extend(sales_warnings)
@@ -1042,6 +1266,12 @@ def login_page(client_id: str, client_secret: str) -> None:
 def dashboard(client_id: str, client_secret: str) -> None:
     persisted_state = load_dashboard_state()
     auto_sync_required = False
+    db_ready = False
+    db_warning = ""
+    try:
+        db_ready = initialize_database()
+    except psycopg2.Error as exc:
+        db_warning = f"Banco temporariamente indisponível: {exc}"
     with st.sidebar:
         st.title("Ultra Loot")
         st.caption("Estoque, consumo e reposição")
@@ -1077,6 +1307,12 @@ def dashboard(client_id: str, client_secret: str) -> None:
             st.success("Categorias sincronizadas")
         else:
             st.caption("Saldo rápido ativo · categorias ainda não sincronizadas")
+        if db_ready:
+            last_db_sync = db_get_state("last_sales_sync", "")
+            st.caption(
+                "🗄️ Cache PostgreSQL ativo"
+                + (f" · vendas até {last_db_sync[:10]}" if last_db_sync else " · primeira carga pendente")
+            )
         st.divider()
         if st.button("Desconectar", use_container_width=True):
             for key in [
@@ -1097,33 +1333,55 @@ def dashboard(client_id: str, client_secret: str) -> None:
         and st.session_state.get("inventory_period") != analysis_days
         and "inventory" in st.session_state
     ):
-        st.session_state.inventory = apply_consumption(
-            st.session_state.inventory, {}, analysis_days
-        )
-        st.session_state.analytics_loaded = False
-        st.session_state.order_count = 0
+        if db_ready:
+            cached_source = db_get_state("sales_source", "Pedidos de venda")
+            cached_consumption = db_load_consumption(
+                start_date, end_date, cached_source
+            )
+            st.session_state.inventory = apply_consumption(
+                st.session_state.inventory, cached_consumption, analysis_days
+            )
+            st.session_state.analytics_loaded = True
+            st.session_state.inventory_period = analysis_days
+        else:
+            st.session_state.inventory = apply_consumption(
+                st.session_state.inventory, {}, analysis_days
+            )
+            st.session_state.analytics_loaded = False
+            st.session_state.order_count = 0
     if "inventory" not in st.session_state:
         try:
             with st.spinner("Carregando produtos e saldo atual..."):
                 inventory = load_basic_inventory(
                     client_id, client_secret, analysis_days
                 )
-                saved_categories = {
-                    int(product_id): str(category)
-                    for product_id, category in persisted_state.get(
-                        "product_categories", {}
-                    ).items()
-                }
+                if db_ready:
+                    saved_categories, saved_costs = db_load_product_metadata()
+                else:
+                    saved_categories = {
+                        int(product_id): str(category)
+                        for product_id, category in persisted_state.get(
+                            "product_categories", {}
+                        ).items()
+                    }
+                    saved_costs = {
+                        int(product_id): number(cost)
+                        for product_id, cost in persisted_state.get(
+                            "product_costs", {}
+                        ).items()
+                    }
                 if saved_categories:
                     mapped = inventory["ID"].map(saved_categories)
                     inventory["Categoria"] = mapped.fillna(inventory["Categoria"])
-                saved_costs = {
-                    int(product_id): number(cost)
-                    for product_id, cost in persisted_state.get(
-                        "product_costs", {}
-                    ).items()
-                }
                 inventory = apply_costs(inventory, saved_costs)
+                if db_ready:
+                    cached_source = db_get_state("sales_source", "Pedidos de venda")
+                    cached_consumption = db_load_consumption(
+                        start_date, end_date, cached_source
+                    )
+                    inventory = apply_consumption(
+                        inventory, cached_consumption, analysis_days
+                    )
                 st.session_state.inventory = inventory
                 st.session_state.inventory_warnings = []
                 st.session_state.order_count = 0
@@ -1143,18 +1401,24 @@ def dashboard(client_id: str, client_secret: str) -> None:
                     "category_audit", []
                 )
                 st.session_state.categories_loaded = bool(saved_categories)
+                st.session_state.metadata_cache_loaded = bool(saved_categories)
                 st.session_state.inventory_period = analysis_days
-                st.session_state.analytics_loaded = False
+                st.session_state.analytics_loaded = bool(
+                    db_ready and db_get_state("last_sales_sync", "")
+                )
                 st.session_state.updated_at = datetime.now(
                     timezone(timedelta(hours=-3))
                 )
                 auto_sync_required = True
-        except requests.RequestException as exc:
-            detail = exc.response.text if exc.response is not None else str(exc)
+        except (requests.RequestException, psycopg2.Error) as exc:
+            response = getattr(exc, "response", None)
+            detail = response.text if response is not None else str(exc)
             st.error(f"Falha ao consultar a API do Bling: {detail}")
             return
 
-    if run_categories or auto_sync_required:
+    if run_categories or (
+        auto_sync_required and not st.session_state.get("metadata_cache_loaded", False)
+    ):
         try:
             with st.spinner("Sincronizando categorias e custos..."):
                 category_map, category_audit, category_warnings = (
@@ -1171,6 +1435,9 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 st.session_state.category_audit = category_audit
                 st.session_state.inventory_warnings = category_warnings + cost_warnings
                 st.session_state.categories_loaded = True
+                st.session_state.metadata_cache_loaded = True
+                if db_ready:
+                    db_save_product_metadata(category_map, product_costs)
                 save_dashboard_state(
                     product_categories={
                         str(product_id): category
@@ -1199,24 +1466,65 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 st.session_state.sync_diagnostics = diagnostics
             if run_categories and not auto_sync_required:
                 st.rerun()
-        except requests.RequestException as exc:
-            detail = exc.response.text if exc.response is not None else str(exc)
+        except (requests.RequestException, psycopg2.Error) as exc:
+            response = getattr(exc, "response", None)
+            detail = response.text if response is not None else str(exc)
             st.error(f"Falha ao sincronizar categorias: {detail}")
 
     if run_analytics or auto_sync_required:
         try:
-            with st.spinner("Consultando pedidos e calculando o consumo..."):
+            with st.spinner("Buscando somente vendas novas ou alteradas..."):
                 product_id_by_code = {
                     str(row["Código"]).strip().casefold(): int(row["ID"])
                     for _, row in st.session_state.inventory.iterrows()
                     if str(row["Código"]).strip()
                 }
-                consumption, order_count, item_count, source, sales_warnings = (
+                preferred_source = (
+                    db_get_state("sales_source", "") if db_ready else ""
+                )
+                last_sync_text = (
+                    db_get_state("last_sales_sync", "") if db_ready else ""
+                )
+                if db_ready and last_sync_text:
+                    try:
+                        last_sync_date = date.fromisoformat(last_sync_text[:10])
+                    except ValueError:
+                        last_sync_date = end_date - timedelta(days=INITIAL_HISTORY_DAYS - 1)
+                    sync_start = max(
+                        end_date - timedelta(days=INITIAL_HISTORY_DAYS - 1),
+                        last_sync_date - timedelta(days=SYNC_OVERLAP_DAYS),
+                    )
+                elif db_ready:
+                    sync_start = end_date - timedelta(days=INITIAL_HISTORY_DAYS - 1)
+                else:
+                    sync_start = start_date
+
+                new_consumption, daily, order_count, item_count, source, sales_warnings = (
                     fetch_sales_consumption(
-                        start_date, end_date, client_id, client_secret,
+                        sync_start, end_date, client_id, client_secret,
                         product_id_by_code,
+                        preferred_source=preferred_source,
                     )
                 )
+                cache_safe = not any(
+                    "não puderam ser detalhados" in warning
+                    for warning in sales_warnings
+                )
+                if (
+                    db_ready
+                    and source in {"Pedidos de venda", "NFC-e"}
+                    and cache_safe
+                ):
+                    db_replace_daily_consumption(sync_start, source, daily)
+                    db_set_state("sales_source", source)
+                    db_set_state("last_sales_sync", end_date.isoformat())
+                    consumption = db_load_consumption(start_date, end_date, source)
+                elif db_ready and preferred_source:
+                    consumption = db_load_consumption(
+                        start_date, end_date, preferred_source
+                    )
+                else:
+                    consumption = new_consumption
                 inventory = apply_consumption(
                     st.session_state.inventory,
                     consumption,
@@ -1234,6 +1542,12 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 diagnostics["Pedidos considerados"] = order_count
                 diagnostics["Itens de pedidos considerados"] = item_count
                 diagnostics["Fonte do consumo"] = source
+                diagnostics["Início da consulta incremental"] = sync_start.strftime(
+                    "%d/%m/%Y"
+                )
+                diagnostics["Dias consultados nesta atualização"] = (
+                    end_date - sync_start
+                ).days + 1
                 diagnostics["Produtos com consumo"] = sum(
                     value > 0 for value in consumption.values()
                 )
@@ -1242,8 +1556,9 @@ def dashboard(client_id: str, client_secret: str) -> None:
                     timezone(timedelta(hours=-3))
                 )
             st.rerun()
-        except requests.RequestException as exc:
-            detail = exc.response.text if exc.response is not None else str(exc)
+        except (requests.RequestException, psycopg2.Error) as exc:
+            response = getattr(exc, "response", None)
+            detail = response.text if response is not None else str(exc)
             st.error(f"Falha ao sincronizar o consumo: {detail}")
 
     df = st.session_state.inventory.copy()
@@ -1273,6 +1588,8 @@ def dashboard(client_id: str, client_secret: str) -> None:
     )
     for warning in warnings:
         st.warning(warning)
+    if db_warning:
+        st.warning(db_warning + " O painel usou o modo tradicional nesta execução.")
     with st.expander("Diagnóstico da sincronização", expanded=False):
         diagnostics = st.session_state.get("sync_diagnostics", {})
         if diagnostics:
@@ -1323,10 +1640,13 @@ def dashboard(client_id: str, client_secret: str) -> None:
         df["Curva ABC"] = "Sem classificação"
 
     if "dashboard_inactive_products" not in st.session_state:
-        st.session_state.dashboard_inactive_products = [
-            int(product_id)
-            for product_id in persisted_state.get("inactive_product_ids", [])
-        ]
+        if db_ready:
+            st.session_state.dashboard_inactive_products = db_load_hidden_products()
+        else:
+            st.session_state.dashboard_inactive_products = [
+                int(product_id)
+                for product_id in persisted_state.get("inactive_product_ids", [])
+            ]
     inactive_ids = set(st.session_state.dashboard_inactive_products)
     if inactive_ids:
         df = df[~df["ID"].isin(inactive_ids)].copy()
@@ -1392,7 +1712,7 @@ def dashboard(client_id: str, client_secret: str) -> None:
             br_currency(active["Valor em estoque (venda)"].sum()), "#0ea5e9",
         )
         metric_card(
-            value_cards[1], "Valor do estoque a preço de custo",
+            value_cards[1], "Valor do estoque a custo/compra",
             br_currency(active["Valor em estoque (custo)"].sum()), "#14b8a6",
         )
 
@@ -1468,6 +1788,8 @@ def dashboard(client_id: str, client_secret: str) -> None:
             ):
                 st.session_state.dashboard_inactive_products = []
                 save_dashboard_state(inactive_product_ids=[])
+                if db_ready:
+                    db_save_hidden_products([])
                 st.rerun()
         else:
             restore_col.caption("Nenhum item oculto")
@@ -1500,9 +1822,13 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 "ID": None,
                 "Saldo atual": st.column_config.NumberColumn(format="%.1f"),
                 "Preço": st.column_config.NumberColumn(format="R$ %.2f"),
-                "Custo cadastrado": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Custo cadastrado": st.column_config.NumberColumn(
+                    "Custo/compra utilizado", format="R$ %.2f"
+                ),
                 "Valor em estoque (venda)": st.column_config.NumberColumn(format="R$ %.2f"),
-                "Valor em estoque (custo)": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Valor em estoque (custo)": st.column_config.NumberColumn(
+                    "Valor em estoque (custo/compra)", format="R$ %.2f"
+                ),
                 "Consumo médio semanal": st.column_config.NumberColumn(format="%.1f"),
                 "Consumo médio mensal": st.column_config.NumberColumn(format="%.1f"),
                 "Cobertura (semanas)": st.column_config.NumberColumn(format="%.1f"),
@@ -1527,6 +1853,8 @@ def dashboard(client_id: str, client_secret: str) -> None:
             saved_ids = sorted(inactive_ids | ids_to_hide)
             st.session_state.dashboard_inactive_products = saved_ids
             save_dashboard_state(inactive_product_ids=saved_ids)
+            if db_ready:
+                db_save_hidden_products(saved_ids)
             st.rerun()
 
         export_columns = [column for column in product_columns if column != "ID"]
