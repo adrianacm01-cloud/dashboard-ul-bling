@@ -247,6 +247,32 @@ def db_replace_daily_consumption(
             )
 
 
+def db_upsert_daily_consumption(
+    source: str,
+    daily: dict[tuple[date, int], float],
+) -> None:
+    """Preserve successful rows when a Bling batch is only partially processed."""
+    rows = [
+        (sale_date, product_id, source, quantity)
+        for (sale_date, product_id), quantity in daily.items()
+    ]
+    if not rows:
+        return
+    with db_connect() as connection, connection.cursor() as cursor:
+        execute_values(
+            cursor,
+            """
+            INSERT INTO ul_daily_consumption
+                (sale_date, product_id, source, quantity, updated_at)
+            VALUES %s
+            ON CONFLICT (sale_date, product_id, source) DO UPDATE SET
+                quantity = EXCLUDED.quantity, updated_at = NOW()
+            """,
+            rows,
+            template="(%s, %s, %s, %s, NOW())",
+        )
+
+
 def db_load_consumption(start_date: date, end_date: date, source: str) -> dict[int, float]:
     result: dict[int, float] = {}
     with db_connect() as connection, connection.cursor() as cursor:
@@ -355,22 +381,36 @@ def api_get(path: str, params, client_id: str, client_secret: str) -> dict:
     if elapsed < REQUEST_INTERVAL:
         time.sleep(REQUEST_INTERVAL - elapsed)
 
-    response = requests.get(
-        f"{API_URL}/{path.lstrip('/')}",
-        headers={
-            "Authorization": f"Bearer {tokens['access_token']}",
-            "Accept": "application/json",
-            "enable-jwt": "1",
-        },
-        params=params,
-        timeout=30,
-    )
-    st.session_state.last_api_request = time.time()
+    refreshed = False
+    for attempt in range(5):
+        response = requests.get(
+            f"{API_URL}/{path.lstrip('/')}",
+            headers={
+                "Authorization": f"Bearer {tokens['access_token']}",
+                "Accept": "application/json",
+                "enable-jwt": "1",
+            },
+            params=params,
+            timeout=30,
+        )
+        st.session_state.last_api_request = time.time()
 
-    if response.status_code == 401 and tokens.get("refresh_token"):
-        refresh_access_token(client_id, client_secret)
-        return api_get(path, params, client_id, client_secret)
-
+        if response.status_code == 401 and tokens.get("refresh_token") and not refreshed:
+            refresh_access_token(client_id, client_secret)
+            tokens = st.session_state.bling_tokens
+            refreshed = True
+            continue
+        if response.status_code == 429 or 500 <= response.status_code < 600:
+            if attempt < 4:
+                retry_after = response.headers.get("Retry-After", "")
+                try:
+                    delay = max(float(retry_after), REQUEST_INTERVAL)
+                except ValueError:
+                    delay = min(2 ** attempt, 8)
+                time.sleep(delay)
+                continue
+        response.raise_for_status()
+        return response.json()
     response.raise_for_status()
     return response.json()
 
@@ -1532,9 +1572,12 @@ def dashboard(client_id: str, client_secret: str) -> None:
                         last_sync_date = date.fromisoformat(last_sync_text[:10])
                     except ValueError:
                         last_sync_date = end_date - timedelta(days=INITIAL_HISTORY_DAYS - 1)
-                    sync_start = last_sync_date - timedelta(days=SYNC_OVERLAP_DAYS)
+                    sync_start = min(
+                        last_sync_date - timedelta(days=SYNC_OVERLAP_DAYS),
+                        start_date,
+                    )
                 elif db_ready:
-                    sync_start = end_date - timedelta(days=INITIAL_HISTORY_DAYS - 1)
+                    sync_start = start_date
                 else:
                     sync_start = start_date
 
@@ -1561,11 +1604,32 @@ def dashboard(client_id: str, client_secret: str) -> None:
                     db_replace_daily_consumption(sync_start, source, daily)
                     db_set_state("sales_source", source)
                     db_set_state("last_sales_sync", end_date.isoformat())
+                    db_set_state(
+                        "last_sales_status",
+                        f"ok|{datetime.now(timezone.utc).isoformat()}|"
+                        f"{order_count}|{item_count}|{len(daily)}",
+                    )
                     consumption = db_load_consumption(start_date, end_date, source)
                 elif db_ready and query_succeeded:
                     # Uma consulta válida sem vendas também é uma sincronização concluída.
                     db_set_state("last_sales_sync", end_date.isoformat())
+                    db_set_state(
+                        "last_sales_status",
+                        f"ok_sem_vendas|{datetime.now(timezone.utc).isoformat()}|"
+                        f"{order_count}|{item_count}|0",
+                    )
                     consumption = new_consumption
+                elif db_ready and daily and source in {"Pedidos de venda", "NFC-e"}:
+                    # Preserve successful rows, but do not advance the checkpoint.
+                    # The next synchronization will retry the same interval.
+                    db_upsert_daily_consumption(source, daily)
+                    db_set_state("sales_source", source)
+                    db_set_state(
+                        "last_sales_status",
+                        f"parcial|{datetime.now(timezone.utc).isoformat()}|"
+                        f"{order_count}|{item_count}|{len(daily)}",
+                    )
+                    consumption = db_load_consumption(start_date, end_date, source)
                 elif db_ready and preferred_source:
                     consumption = db_load_consumption(
                         start_date, end_date, preferred_source
@@ -1606,6 +1670,14 @@ def dashboard(client_id: str, client_secret: str) -> None:
         except (requests.RequestException, psycopg2.Error) as exc:
             response = getattr(exc, "response", None)
             detail = response.text if response is not None else str(exc)
+            if db_ready:
+                try:
+                    db_set_state(
+                        "last_sales_status",
+                        f"erro|{datetime.now(timezone.utc).isoformat()}|{detail[:500]}",
+                    )
+                except psycopg2.Error:
+                    pass
             st.error(f"Falha ao sincronizar o consumo: {detail}")
 
     df = st.session_state.inventory.copy()
