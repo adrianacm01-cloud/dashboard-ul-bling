@@ -61,6 +61,15 @@ st.markdown(
         [data-testid="stDataFrame"] { border: 1px solid rgba(148,163,184,.18); border-radius: 14px; }
         .stTabs [data-baseweb="tab-list"] { gap: .5rem; }
         .stTabs [data-baseweb="tab"] { border-radius: 999px; padding: .35rem 1rem; }
+        .ul-hero { display:flex; align-items:center; gap:22px; padding:22px 28px;
+            border-radius:22px; margin-bottom:18px;
+            background:linear-gradient(120deg,#111827,#312e81 58%,#6d28d9);
+            box-shadow:0 14px 34px rgba(49,46,129,.22); }
+        .ul-hero img { width:112px; max-height:72px; object-fit:contain; }
+        .ul-hero-title { color:white; font-size:2.15rem; font-weight:850; line-height:1.1; }
+        .ul-hero-subtitle { color:#ddd6fe; margin-top:7px; font-size:.96rem; }
+        .ul-filter-title { font-size:1.2rem; font-weight:800; margin-bottom:.15rem; }
+        div[data-testid="stVerticalBlockBorderWrapper"] { border-radius:18px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1232,6 +1241,15 @@ def metric_card(container, label: str, value: str, color: str) -> None:
     )
 
 
+def logo_data_uri() -> str:
+    logo_path = Path(__file__).with_name("logo branco.jpeg")
+    try:
+        encoded = base64.b64encode(logo_path.read_bytes()).decode()
+        return f"data:image/jpeg;base64,{encoded}"
+    except OSError:
+        return ""
+
+
 def handle_oauth(client_id: str, client_secret: str) -> None:
     error = st.query_params.get("error")
     code = st.query_params.get("code")
@@ -1273,7 +1291,11 @@ def dashboard(client_id: str, client_secret: str) -> None:
     except psycopg2.Error as exc:
         db_warning = f"Banco temporariamente indisponível: {exc}"
     with st.sidebar:
-        st.title("Ultra Loot")
+        logo_path = Path(__file__).with_name("logo branco.jpeg")
+        if logo_path.exists():
+            st.image(str(logo_path), use_container_width=True)
+        else:
+            st.title("Ultra Loot")
         st.caption("Estoque, consumo e reposição")
         analysis_days = st.selectbox(
             "Período para consumo", [30, 60, 90, 180], index=0,
@@ -1490,10 +1512,7 @@ def dashboard(client_id: str, client_secret: str) -> None:
                         last_sync_date = date.fromisoformat(last_sync_text[:10])
                     except ValueError:
                         last_sync_date = end_date - timedelta(days=INITIAL_HISTORY_DAYS - 1)
-                    sync_start = max(
-                        end_date - timedelta(days=INITIAL_HISTORY_DAYS - 1),
-                        last_sync_date - timedelta(days=SYNC_OVERLAP_DAYS),
-                    )
+                    sync_start = last_sync_date - timedelta(days=SYNC_OVERLAP_DAYS)
                 elif db_ready:
                     sync_start = end_date - timedelta(days=INITIAL_HISTORY_DAYS - 1)
                 else:
@@ -1566,7 +1585,15 @@ def dashboard(client_id: str, client_secret: str) -> None:
     updated_at = st.session_state.get("updated_at")
     order_count = st.session_state.get("order_count", 0)
 
-    st.title("📦 Dashboard de Estoque")
+    logo_uri = logo_data_uri()
+    logo_html = f'<img src="{logo_uri}" alt="Ultra Loot">' if logo_uri else "📦"
+    st.markdown(
+        f"""<div class="ul-hero">{logo_html}<div>
+        <div class="ul-hero-title">Dashboard de Estoque</div>
+        <div class="ul-hero-subtitle">Estoque, consumo e reposição · integrado ao Bling</div>
+        </div></div>""",
+        unsafe_allow_html=True,
+    )
     timestamp = updated_at.strftime("%d/%m/%Y às %H:%M") if updated_at else "agora"
     if st.session_state.get("analytics_loaded"):
         subtitle = (
@@ -1590,35 +1617,6 @@ def dashboard(client_id: str, client_secret: str) -> None:
         st.warning(warning)
     if db_warning:
         st.warning(db_warning + " O painel usou o modo tradicional nesta execução.")
-    with st.expander("Diagnóstico da sincronização", expanded=False):
-        diagnostics = st.session_state.get("sync_diagnostics", {})
-        if diagnostics:
-            diagnostic_df = pd.DataFrame(
-                diagnostics.items(), columns=["Dado", "Quantidade"]
-            )
-            st.dataframe(diagnostic_df, hide_index=True, use_container_width=True)
-        st.caption(
-            "Se categorias, custos ou itens aparecerem zerados após a sincronização, "
-            "a origem não foi retornada pela API ou falta permissão para o recurso."
-        )
-    category_audit = st.session_state.get("category_audit", [])
-    if category_audit:
-        with st.expander("Auditoria dos filtros de categoria", expanded=False):
-            audit_df = pd.DataFrame(category_audit)
-            st.dataframe(
-                audit_df.sort_values(
-                    ["Produtos retornados pelo filtro", "Categoria"],
-                    ascending=[False, True],
-                ),
-                hide_index=True,
-                use_container_width=True,
-            )
-            st.download_button(
-                "Baixar auditoria de categorias (CSV)",
-                audit_df.to_csv(index=False, sep=";").encode("utf-8-sig"),
-                file_name="auditoria_categorias_bling.csv",
-                mime="text/csv",
-            )
     if df.empty:
         st.info("Nenhum produto foi retornado pela API.")
         return
@@ -1641,21 +1639,62 @@ def dashboard(client_id: str, client_secret: str) -> None:
 
     if "dashboard_inactive_products" not in st.session_state:
         if db_ready:
-            st.session_state.dashboard_inactive_products = db_load_hidden_products()
+            database_hidden = db_load_hidden_products()
+            local_hidden = [
+                int(product_id)
+                for product_id in persisted_state.get("inactive_product_ids", [])
+            ]
+            if not database_hidden and local_hidden:
+                db_save_hidden_products(local_hidden)
+                database_hidden = local_hidden
+            st.session_state.dashboard_inactive_products = database_hidden
         else:
             st.session_state.dashboard_inactive_products = [
                 int(product_id)
                 for product_id in persisted_state.get("inactive_product_ids", [])
             ]
     inactive_ids = set(st.session_state.dashboard_inactive_products)
+    hidden_with_stock = df[
+        df["ID"].isin(inactive_ids) & (df["Saldo atual"] > 0)
+    ].copy()
+    if not hidden_with_stock.empty:
+        hidden_names = ", ".join(hidden_with_stock["Produto"].head(6).astype(str))
+        remaining = len(hidden_with_stock) - min(len(hidden_with_stock), 6)
+        if remaining > 0:
+            hidden_names += f" e mais {remaining}"
+        st.warning(
+            f"⚠️ {len(hidden_with_stock)} produto(s) oculto(s) voltaram a ter "
+            f"saldo positivo: {hidden_names}."
+        )
+        if st.button(
+            "Desocultar produtos que voltaram ao estoque",
+            type="primary",
+            key="restore_positive_hidden",
+        ):
+            restored_ids = set(hidden_with_stock["ID"].astype(int))
+            remaining_hidden = sorted(inactive_ids - restored_ids)
+            st.session_state.dashboard_inactive_products = remaining_hidden
+            save_dashboard_state(inactive_product_ids=remaining_hidden)
+            if db_ready:
+                db_save_hidden_products(remaining_hidden)
+            st.rerun()
     if inactive_ids:
         df = df[~df["ID"].isin(inactive_ids)].copy()
 
-    with st.expander("Filtros", expanded=True):
-        f1, f2, f3, f4 = st.columns([2.3, 1.1, 1.4, 1.5])
-        search = f1.text_input("Buscar produto ou código", placeholder="Digite para pesquisar")
+    with st.container(border=True):
+        st.markdown('<div class="ul-filter-title">🔎 Encontre os produtos</div>', unsafe_allow_html=True)
+        st.caption("Combine busca, situação, criticidade, categoria e disponibilidade.")
+        search_col, stock_col = st.columns([3.5, 1.2], vertical_alignment="bottom")
+        search = search_col.text_input(
+            "Buscar produto ou código",
+            placeholder="Digite o nome, SKU ou código de barras...",
+        )
+        positive_only = stock_col.toggle("Somente com saldo", value=False)
+        f2, f3, f4 = st.columns([1.1, 1.3, 2.0])
+        situation_options = sorted(df["Situação"].unique())
         situations = f2.multiselect(
-            "Situação", sorted(df["Situação"].unique()), default=["Ativo"]
+            "Situação", situation_options,
+            default=["Ativo"] if "Ativo" in situation_options else [],
         )
         replenishment_status = f3.multiselect(
             "Criticidade",
@@ -1680,6 +1719,8 @@ def dashboard(client_id: str, client_secret: str) -> None:
         ]
     if categories:
         filtered = filtered[filtered["Categoria"].isin(categories)]
+    if positive_only:
+        filtered = filtered[filtered["Saldo atual"] > 0]
 
     filtered["Sinal"] = filtered["Criticidade"].map(
         {"Crítico": "🔴 Crítico", "Atenção": "🟠 Atenção", "Adequado": "🟢 Adequado"}

@@ -38,14 +38,16 @@ Com `DATABASE_URL` configurada, o aplicativo cria automaticamente as tabelas
 
 - A primeira carga importa até 180 dias, que é o maior período disponível no painel.
 - Categorias e custos são reutilizados do banco nas próximas sessões.
-- A atualização seguinte consulta somente os últimos três dias anteriores à
-  última sincronização, além do dia atual. Essa sobreposição captura alterações
-  e cancelamentos recentes.
+- A atualização seguinte começa exatamente três dias antes da data da última
+  sincronização e segue até o dia atual. Essa sobreposição captura alterações e
+  cancelamentos recentes e também cobre todos os dias desde a última execução.
 - O consumo é armazenado por dia e produto, permitindo trocar entre 30, 60, 90
   e 180 dias sem consultar novamente todos os pedidos.
 - Uma carga parcial com falha de detalhamento não substitui dados válidos já
   armazenados.
 - Sem banco disponível, o painel mantém o fluxo tradicional como contingência.
+- Produtos ocultos ficam persistidos no banco. Se algum deles voltar a ter saldo
+  positivo, o painel mostra um aviso e oferece uma ação para desocultá-lo.
 
 ## Segurança
 
