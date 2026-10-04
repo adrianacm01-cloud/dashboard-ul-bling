@@ -141,6 +141,14 @@ def initialize_database() -> bool:
                 product_id BIGINT PRIMARY KEY,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            ALTER TABLE ul_product_metadata ENABLE ROW LEVEL SECURITY;
+            ALTER TABLE ul_daily_consumption ENABLE ROW LEVEL SECURITY;
+            ALTER TABLE ul_sync_state ENABLE ROW LEVEL SECURITY;
+            ALTER TABLE ul_hidden_products ENABLE ROW LEVEL SECURITY;
+            REVOKE ALL ON TABLE ul_product_metadata FROM anon, authenticated;
+            REVOKE ALL ON TABLE ul_daily_consumption FROM anon, authenticated;
+            REVOKE ALL ON TABLE ul_sync_state FROM anon, authenticated;
+            REVOKE ALL ON TABLE ul_hidden_products FROM anon, authenticated;
             """
         )
     return True
@@ -1290,6 +1298,7 @@ def dashboard(client_id: str, client_secret: str) -> None:
         db_ready = initialize_database()
     except psycopg2.Error as exc:
         db_warning = f"Banco temporariamente indisponível: {exc}"
+    database_last_sync = db_get_state("last_sales_sync", "") if db_ready else ""
     with st.sidebar:
         logo_path = Path(__file__).with_name("logo branco.jpeg")
         if logo_path.exists():
@@ -1331,12 +1340,11 @@ def dashboard(client_id: str, client_secret: str) -> None:
         else:
             st.caption("Saldo rápido ativo · categorias ainda não sincronizadas")
         if db_ready:
-            last_db_sync = db_get_state("last_sales_sync", "")
             st.caption(
                 "🗄️ Cache PostgreSQL ativo"
                 + (
-                    f" · última carga {last_db_sync[:10]} · sobreposição de 3 dias"
-                    if last_db_sync else " · primeira carga pendente"
+                    f" · última carga {database_last_sync[:10]} · sobreposição de 3 dias"
+                    if database_last_sync else " · primeira carga pendente"
                 )
             )
         st.divider()
@@ -1354,6 +1362,12 @@ def dashboard(client_id: str, client_secret: str) -> None:
 
     end_date = date.today()
     start_date = end_date - timedelta(days=analysis_days - 1)
+    first_database_sync = db_ready and not database_last_sync
+    if (
+        first_database_sync
+        and not st.session_state.get("initial_db_sync_attempted", False)
+    ):
+        auto_sync_required = True
     if (
         st.session_state.get("analytics_loaded")
         and st.session_state.get("inventory_period") != analysis_days
@@ -1500,6 +1514,8 @@ def dashboard(client_id: str, client_secret: str) -> None:
     if run_analytics or auto_sync_required:
         try:
             with st.spinner("Buscando somente vendas novas ou alteradas..."):
+                if first_database_sync:
+                    st.session_state.initial_db_sync_attempted = True
                 product_id_by_code = {
                     str(row["Código"]).strip().casefold(): int(row["ID"])
                     for _, row in st.session_state.inventory.iterrows()
@@ -1533,15 +1549,23 @@ def dashboard(client_id: str, client_secret: str) -> None:
                     "não puderam ser detalhados" in warning
                     for warning in sales_warnings
                 )
+                query_succeeded = cache_safe and not any(
+                    "não pôde ser consultada" in warning
+                    for warning in sales_warnings
+                )
                 if (
                     db_ready
                     and source in {"Pedidos de venda", "NFC-e"}
-                    and cache_safe
+                    and query_succeeded
                 ):
                     db_replace_daily_consumption(sync_start, source, daily)
                     db_set_state("sales_source", source)
                     db_set_state("last_sales_sync", end_date.isoformat())
                     consumption = db_load_consumption(start_date, end_date, source)
+                elif db_ready and query_succeeded:
+                    # Uma consulta válida sem vendas também é uma sincronização concluída.
+                    db_set_state("last_sales_sync", end_date.isoformat())
+                    consumption = new_consumption
                 elif db_ready and preferred_source:
                     consumption = db_load_consumption(
                         start_date, end_date, preferred_source
@@ -1621,6 +1645,12 @@ def dashboard(client_id: str, client_secret: str) -> None:
         st.warning(warning)
     if db_warning:
         st.warning(db_warning + " O painel usou o modo tradicional nesta execução.")
+    if first_database_sync and st.session_state.get("initial_db_sync_attempted"):
+        st.warning(
+            "A primeira carga de vendas ainda não foi registrada. Clique em "
+            "‘Atualizar consumo incremental’ para tentar novamente. A data será "
+            "salva no PostgreSQL somente após uma consulta válida."
+        )
     if df.empty:
         st.info("Nenhum produto foi retornado pela API.")
         return
