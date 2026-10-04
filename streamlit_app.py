@@ -141,6 +141,14 @@ def initialize_database() -> bool:
                 product_id BIGINT PRIMARY KEY,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            ALTER TABLE ul_product_metadata ENABLE ROW LEVEL SECURITY;
+            ALTER TABLE ul_daily_consumption ENABLE ROW LEVEL SECURITY;
+            ALTER TABLE ul_sync_state ENABLE ROW LEVEL SECURITY;
+            ALTER TABLE ul_hidden_products ENABLE ROW LEVEL SECURITY;
+            REVOKE ALL ON TABLE ul_product_metadata FROM anon, authenticated;
+            REVOKE ALL ON TABLE ul_daily_consumption FROM anon, authenticated;
+            REVOKE ALL ON TABLE ul_sync_state FROM anon, authenticated;
+            REVOKE ALL ON TABLE ul_hidden_products FROM anon, authenticated;
             """
         )
     return True

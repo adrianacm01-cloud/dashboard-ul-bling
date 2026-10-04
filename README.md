@@ -35,6 +35,9 @@ DATABASE_URL = "postgresql://...pooler.supabase.com:5432/postgres?sslmode=requir
 Com `DATABASE_URL` configurada, o aplicativo cria automaticamente as tabelas
 `ul_product_metadata`, `ul_daily_consumption`, `ul_sync_state` e
 `ul_hidden_products`. Nenhuma migração manual é necessária.
+As quatro tabelas são criadas com Row Level Security habilitada e sem políticas
+públicas; privilégios de `anon` e `authenticated` são revogados. O dashboard
+continua acessando-as pela conexão PostgreSQL privada armazenada nos Secrets.
 
 - A primeira carga importa até 180 dias, que é o maior período disponível no painel.
 - Categorias e custos são reutilizados do banco nas próximas sessões.
