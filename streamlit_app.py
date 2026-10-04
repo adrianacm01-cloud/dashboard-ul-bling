@@ -1317,10 +1317,11 @@ def dashboard(client_id: str, client_secret: str) -> None:
             help="Consulta categorias e custos dos fornecedores sem carregar pedidos.",
         )
         run_analytics = st.button(
-            "Atualizar consumo",
+            "Atualizar consumo incremental",
             use_container_width=True,
             help=(
-                "Consulta os pedidos do período para calcular médias e criticidade."
+                "Lê no banco a última atualização e consulta o Bling desde três "
+                "dias antes dessa data até hoje."
             ),
         )
         if st.session_state.get("analytics_loaded"):
@@ -1333,7 +1334,10 @@ def dashboard(client_id: str, client_secret: str) -> None:
             last_db_sync = db_get_state("last_sales_sync", "")
             st.caption(
                 "🗄️ Cache PostgreSQL ativo"
-                + (f" · vendas até {last_db_sync[:10]}" if last_db_sync else " · primeira carga pendente")
+                + (
+                    f" · última carga {last_db_sync[:10]} · sobreposição de 3 dias"
+                    if last_db_sync else " · primeira carga pendente"
+                )
             )
         st.divider()
         if st.button("Desconectar", use_container_width=True):
