@@ -25,6 +25,7 @@ REQUEST_INTERVAL = 0.36
 STATE_FILE = Path(__file__).with_name("dashboard_state.json")
 INITIAL_HISTORY_DAYS = 180
 SYNC_OVERLAP_DAYS = 3
+SALES_CHUNK_DAYS = 7
 
 st.set_page_config(
     page_title="Ultra Loot | Estoque",
@@ -220,6 +221,7 @@ def db_save_product_metadata(
 
 def db_replace_daily_consumption(
     start_date: date,
+    end_date: date,
     source: str,
     daily: dict[tuple[date, int], float],
 ) -> None:
@@ -229,8 +231,9 @@ def db_replace_daily_consumption(
     ]
     with db_connect() as connection, connection.cursor() as cursor:
         cursor.execute(
-            "DELETE FROM ul_daily_consumption WHERE source = %s AND sale_date >= %s",
-            (source, start_date),
+            """DELETE FROM ul_daily_consumption
+               WHERE source = %s AND sale_date BETWEEN %s AND %s""",
+            (source, start_date, end_date),
         )
         if rows:
             execute_values(
@@ -1408,6 +1411,14 @@ def dashboard(client_id: str, client_secret: str) -> None:
         and not st.session_state.get("initial_db_sync_attempted", False)
     ):
         auto_sync_required = True
+    elif (
+        db_ready
+        and database_last_sync
+        and not st.session_state.get("auto_incremental_attempted", False)
+    ):
+        # Once per browser session, check only the interval after the DB checkpoint.
+        auto_sync_required = True
+        st.session_state.auto_incremental_attempted = True
     if (
         st.session_state.get("analytics_loaded")
         and st.session_state.get("inventory_period") != analysis_days
@@ -1567,75 +1578,124 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 last_sync_text = (
                     db_get_state("last_sales_sync", "") if db_ready else ""
                 )
-                if db_ready and last_sync_text:
-                    try:
-                        last_sync_date = date.fromisoformat(last_sync_text[:10])
-                    except ValueError:
-                        last_sync_date = end_date - timedelta(days=INITIAL_HISTORY_DAYS - 1)
-                    sync_start = min(
-                        last_sync_date - timedelta(days=SYNC_OVERLAP_DAYS),
-                        start_date,
-                    )
-                elif db_ready:
-                    sync_start = start_date
-                else:
-                    sync_start = start_date
+                history_start_text = (
+                    db_get_state("sales_history_start", "") if db_ready else ""
+                )
+                try:
+                    last_sync_date = date.fromisoformat(last_sync_text[:10])
+                except ValueError:
+                    last_sync_date = None
+                try:
+                    history_start_date = date.fromisoformat(history_start_text[:10])
+                except ValueError:
+                    history_start_date = None
 
-                new_consumption, daily, order_count, item_count, source, sales_warnings = (
-                    fetch_sales_consumption(
-                        sync_start, end_date, client_id, client_secret,
-                        product_id_by_code,
-                        preferred_source=preferred_source,
+                intervals: list[tuple[date, date]] = []
+                if history_start_date is None:
+                    intervals.append((start_date, end_date))
+                else:
+                    if start_date < history_start_date:
+                        intervals.append(
+                            (start_date, history_start_date - timedelta(days=1))
+                        )
+                    incremental_start = (
+                        last_sync_date - timedelta(days=SYNC_OVERLAP_DAYS)
+                        if last_sync_date else history_start_date
                     )
-                )
-                cache_safe = not any(
-                    "não puderam ser detalhados" in warning
-                    for warning in sales_warnings
-                )
-                query_succeeded = cache_safe and not any(
-                    "não pôde ser consultada" in warning
-                    for warning in sales_warnings
-                )
-                if (
-                    db_ready
-                    and source in {"Pedidos de venda", "NFC-e"}
-                    and query_succeeded
-                ):
-                    db_replace_daily_consumption(sync_start, source, daily)
-                    db_set_state("sales_source", source)
+                    intervals.append((max(incremental_start, start_date), end_date))
+
+                # Merge overlapping historical/backfill and incremental intervals.
+                merged: list[tuple[date, date]] = []
+                for interval_start, interval_end in sorted(intervals):
+                    if interval_start > interval_end:
+                        continue
+                    if merged and interval_start <= merged[-1][1] + timedelta(days=1):
+                        merged[-1] = (merged[-1][0], max(merged[-1][1], interval_end))
+                    else:
+                        merged.append((interval_start, interval_end))
+
+                chunks: list[tuple[date, date]] = []
+                for interval_start, interval_end in merged:
+                    chunk_start = interval_start
+                    while chunk_start <= interval_end:
+                        chunk_end = min(
+                            chunk_start + timedelta(days=SALES_CHUNK_DAYS - 1),
+                            interval_end,
+                        )
+                        chunks.append((chunk_start, chunk_end))
+                        chunk_start = chunk_end + timedelta(days=1)
+
+                sales_warnings: list[str] = []
+                order_count = 0
+                item_count = 0
+                saved_rows = 0
+                failed_chunks = 0
+                successful_chunks = 0
+                source = preferred_source or "Pedidos de venda"
+                batch_progress = st.progress(0, text="Importando histórico de vendas...")
+                for chunk_index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+                    try:
+                        _, daily, chunk_orders, chunk_items, chunk_source, chunk_warnings = (
+                            fetch_sales_consumption(
+                                chunk_start, chunk_end, client_id, client_secret,
+                                product_id_by_code,
+                                preferred_source=preferred_source,
+                            )
+                        )
+                        source = chunk_source if chunk_source in {
+                            "Pedidos de venda", "NFC-e"
+                        } else source
+                        if not preferred_source and source in {
+                            "Pedidos de venda", "NFC-e"
+                        }:
+                            preferred_source = source
+                        complete_chunk = not any(
+                            "não puderam ser detalhados" in warning
+                            or "não pôde ser consultada" in warning
+                            for warning in chunk_warnings
+                        )
+                        if db_ready and source in {"Pedidos de venda", "NFC-e"}:
+                            if complete_chunk:
+                                db_replace_daily_consumption(
+                                    chunk_start, chunk_end, source, daily
+                                )
+                            else:
+                                db_upsert_daily_consumption(source, daily)
+                            db_set_state("sales_source", source)
+                        order_count += chunk_orders
+                        item_count += chunk_items
+                        saved_rows += len(daily)
+                        successful_chunks += 1
+                        sales_warnings.extend(chunk_warnings)
+                    except requests.RequestException as exc:
+                        failed_chunks += 1
+                        response = getattr(exc, "response", None)
+                        detail = response.text if response is not None else str(exc)
+                        sales_warnings.append(
+                            f"O período de {chunk_start:%d/%m/%Y} a "
+                            f"{chunk_end:%d/%m/%Y} falhou e foi ignorado: {detail[:300]}"
+                        )
+                    batch_progress.progress(
+                        chunk_index / max(len(chunks), 1),
+                        text=f"Salvando vendas: bloco {chunk_index} de {len(chunks)}",
+                    )
+                batch_progress.empty()
+
+                if db_ready and successful_chunks:
                     db_set_state("last_sales_sync", end_date.isoformat())
+                    db_set_state("sales_history_start", start_date.isoformat())
+                    status = "parcial" if failed_chunks or sales_warnings else "ok"
                     db_set_state(
                         "last_sales_status",
-                        f"ok|{datetime.now(timezone.utc).isoformat()}|"
-                        f"{order_count}|{item_count}|{len(daily)}",
-                    )
-                    consumption = db_load_consumption(start_date, end_date, source)
-                elif db_ready and query_succeeded:
-                    # Uma consulta válida sem vendas também é uma sincronização concluída.
-                    db_set_state("last_sales_sync", end_date.isoformat())
-                    db_set_state(
-                        "last_sales_status",
-                        f"ok_sem_vendas|{datetime.now(timezone.utc).isoformat()}|"
-                        f"{order_count}|{item_count}|0",
-                    )
-                    consumption = new_consumption
-                elif db_ready and daily and source in {"Pedidos de venda", "NFC-e"}:
-                    # Preserve successful rows, but do not advance the checkpoint.
-                    # The next synchronization will retry the same interval.
-                    db_upsert_daily_consumption(source, daily)
-                    db_set_state("sales_source", source)
-                    db_set_state(
-                        "last_sales_status",
-                        f"parcial|{datetime.now(timezone.utc).isoformat()}|"
-                        f"{order_count}|{item_count}|{len(daily)}",
+                        f"{status}|{datetime.now(timezone.utc).isoformat()}|"
+                        f"{order_count}|{item_count}|{saved_rows}|"
+                        f"blocos_falhos={failed_chunks}",
                     )
                     consumption = db_load_consumption(start_date, end_date, source)
                 elif db_ready and preferred_source:
-                    consumption = db_load_consumption(
-                        start_date, end_date, preferred_source
-                    )
+                    consumption = db_load_consumption(start_date, end_date, preferred_source)
                 else:
-                    consumption = new_consumption
+                    consumption = {}
                 inventory = apply_consumption(
                     st.session_state.inventory,
                     consumption,
@@ -1653,11 +1713,11 @@ def dashboard(client_id: str, client_secret: str) -> None:
                 diagnostics["Pedidos considerados"] = order_count
                 diagnostics["Itens de pedidos considerados"] = item_count
                 diagnostics["Fonte do consumo"] = source
-                diagnostics["Início da consulta incremental"] = sync_start.strftime(
+                diagnostics["Início da consulta incremental"] = start_date.strftime(
                     "%d/%m/%Y"
                 )
                 diagnostics["Dias consultados nesta atualização"] = (
-                    end_date - sync_start
+                    end_date - start_date
                 ).days + 1
                 diagnostics["Produtos com consumo"] = sum(
                     value > 0 for value in consumption.values()
